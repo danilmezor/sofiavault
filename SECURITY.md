@@ -77,3 +77,19 @@ the vault is upgraded automatically:
 The master password and its verification data are unchanged; your existing
 master password continues to work. After verifying the upgrade you may delete
 the `.v1-backup` file — it still contains the old plaintext metadata.
+
+## Vault Wipe
+
+`sofiavault wipe` requires the master password plus a typed confirmation
+phrase. It then overwrites an explicit allowlist of SofiaVault's own files
+(`vault.db`, its WAL/journal, migration and import backups, and the command
+history) with 3 passes of CSPRNG data, fsyncing between passes, before
+deleting them. Symlinks are removed without following, and no directory is
+swept — files outside the allowlist are never touched.
+
+**Honest limitation:** on SSDs (wear leveling) and copy-on-write filesystems
+(APFS, Btrfs, ZFS), overwriting a file in place does not guarantee the
+original physical blocks are erased. Software-level shredding is best-effort
+there. The reliable protection against forensic recovery is full-disk
+encryption (FileVault, BitLocker, LUKS) — with it, a wiped vault is
+unrecoverable regardless of filesystem behavior.

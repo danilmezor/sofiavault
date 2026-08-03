@@ -194,6 +194,30 @@ Master Password
            service + username + URL + password
 ```
 
+## Using Multiple Devices
+
+The vault is a single encrypted file, so moving it between machines is simple:
+
+```bash
+sofiavault export             # shows the vault file location (clickable link)
+sofiavault import vault.db    # installs a vault file copied from another device
+sofiavault wipe               # permanently destroys the vault on this machine
+```
+
+- **export** prints where `vault.db` lives. The file is fully encrypted —
+  safe to copy via USB drive or cloud storage. You'll need your master
+  password on the other device.
+- **import** auto-detects whether the file is a vault or a CSV. For a vault
+  file it verifies the file's master password *before* touching anything,
+  backs up any existing local vault to `vault.db.replaced-backup`, then
+  copies it into place. Works on a brand-new device with no vault yet.
+- **wipe** asks for your master password plus a typed confirmation phrase,
+  then overwrites the vault, its backups, and the command history with
+  random data (3 passes) before deleting them. Only SofiaVault's own files
+  are touched — nothing else on disk. Note: on SSDs and copy-on-write
+  filesystems, software overwriting can't guarantee physical erasure;
+  full-disk encryption (FileVault/BitLocker/LUKS) is the reliable backstop.
+
 ## Staying Up to Date
 
 If you installed from a git clone (the `setup.sh` / `install.py` path), every

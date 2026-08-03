@@ -40,7 +40,7 @@ except ImportError:
 # Configuration
 # ─────────────────────────────────────────────────────────────────────────────
 
-__version__ = "0.2.1"
+__version__ = "0.2.2"
 
 DB_PATH = Path.home() / ".sofiavault" / "vault.db"
 HISTORY_PATH = Path.home() / ".sofiavault" / ".history"
@@ -667,45 +667,36 @@ def _hr(char: str = "─") -> str:
 def print_banner():
     """Print the SofiaVault banner"""
     art = r"""
-                                ,;;
-              !!!!!!!' ,!!!!;  ;!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!>,
-           !!!!' ,.'!!!!!!!!!!!!!!!!!!!!!!!!!!!!'
-          !!!!!!!!!!!'                                             <> '!!!!!!!
-          !!!!!!!!!!                                                '!> '!!!!!
-          !!!!!!!!'                                                  '!> '!!!!
-          !!!!!!!                                          .,,.       '!>  !!!
-          !!!!          d$$$$$$$$$$$$?????-           d$$P   ????$$$$$,  '! !!!!
-          !!!           ???$$????      '?c, ,,cccc, '?           ?$    '!>'!!!
-          !!> zc,._                    ,cc,$$$$$$$$$$bc                  !> !!!
-          !! <$$L   '"c,   b,       ,c$$$$$$$$$$$$$$$$$$c ,,c,           '! '!!
-          !! $$$$$$ccc$$?? 'M, ;;' c$$$$$$$   '"$$$b'?$$"'?             '!  !!!
-          ! <$$$$$$$$P  , !!!!!!!!!!!!!!!!!
-          ! $$$$L._   ;!!!''',,  $$$$$$$$$$F ,$PFz,  ?$F  ,cb             !! !!
-          > $$$$$r'Mn,'!' ,d$$F d$$$$$$$$$$$c$$$ $$c.  ?,;' )             !! !!
-           <$$$$P  ,, ,/ ,$$$$$F,$$$$$$$$$$$$$$$$ "   34$?,ccF ..::..      !! !!
-           J$$$P :!!!! z$$$$$$bJ$$$$$$$$$$$$$?$$,'hcdFdF  .::::::    ;!! !!!!
-           $b =e,_'!! <$$$$$$$$$$$$$$$$$$$$$$h?$$,'? .- .:::::::::::'    ;!> !!
-           $$$c  M';f $$$$$$$$$$$$$$$$$$$$$$$$$L?$, ,z$$L':::::::'' .    !!> !!
-          J$$$F >;;!  $$$$P)$$$$$$$$$$$$$$$$$$$$$$bd$$$$$ 4c,,,,cd$F?c   !!> !!
-          J$$$F !!!!> $$$P,$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$ J$$$$$P?$P'$$  !!' !!
-          J$$$F ',,'>  ?$F,$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$ $?c$$ 3$  ?bcr !!  !!
-          J$$c,' ' ,!; ? J$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$'<$cP    ,$c$$F !! .!!
-          $P   ?b,'!!!;  $$$$$$$$$$$$$$$$$$$$$$$$$$$$$$' c,,cdP  ,$$$$P :!! :!!
-          L    d$$c '!!! $$$$$$$$$$$$$$$$$$$$$$$$$$$$$' d$$$F,zP $$$$F z,'' :!!
-          $$$$$$$$$$c '' '$$$$$$$$$$$$$$$$$$$$$$$$$$$',$$$",d$" d$$P",d   ". '!
-                ,$$$$$  ,c$$PF )$$$$$$$$bc,.  ?$P ,c$$PFF   ,,,   d$$$$$$ccc$$$
-               ,$$$$F d$$P ,zd$$$PF ,J$$$$$$$be. ' .,ccd$$$$$$$$b,  $$$$$$$$$$$
-            ,zd$$$$$L ?$ ,d$$$P ,cd$$$$$$$P  ,,cd$$$$$$$$$$$$$$$???-'?$$$$$$$$$
-          ?$$$$$$$$$$b,. $$$$ ,d$$$$$$$P ,c$$$$$$$$$$$$$$$$$P  ,ccccccc,,.CC$$$
-          ?$$$$$$$$$$$$$,  ?L $$$$$$$P ,$$$$$$$$$$$$$$$$$$$P ,d$$$$$$$$$$$$$$$$$
-          <$$$$$$$$$$$$$$$$cc,.     ,c$$$$$$$$$$$$$$$$$$  z$$$$$$$$$$$$$$$$$$$P
-          '$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$P ,z$$$$$$$$$$$$$$$$$$$P"
-            ?$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$P',d$$$$$$$$$$$$$$$$$PF
-              "?$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$P"    '""""??????""""""
-                 "?$$$$$$$$$$$$$$$$$$$$$$$$PF"
-                     ""???$$$$$$$$$$PF""'
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣴⣾⣿⣷⣦⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣤⣴⣦⣤⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣠⣿⠏⠀⠈⠙⠿⣿⣄⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣴⡿⠋⠀⠈⠙⢿⣦⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣶⣤⣤⣶⣿⠏⠀⠀⠀⠀⠀⠈⠻⣦⣤⣶⡶⢶⣶⣶⣶⣶⣿⣏⡀⠀⣰⡄⠀⠀⠻⣿⣄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢿⣿⣌⠉⠁⠀⠀⢀⣠⡿⠀⠀⠀⠈⠳⡀⠀⠀⠀⠀⠀⠈⠉⠛⠻⠿⣿⣿⣦⣄⡀⠈⠻⠿⢶⣶⠂⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⠿⣿⣿⣷⣶⣾⣿⣯⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠉⠛⠻⣿⣿⡿⠿⠛⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣠⡴⠟⣽⠟⠉⣿⠀⠀⣠⣶⣿⣿⣿⣷⣦⣄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠉⠻⣷⣤⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⡀⠀⠀⠀⠀⠀⠀⠀⠀⣠⡾⠋⢀⣾⠃⠀⠀⠏⠀⡴⠛⠉⠀⠀⠉⢻⣿⣿⣿⣦⡀⠀⠀⠀⠀⢠⠀⠀⠈⢦⡀⠀⠀⠙⢿⣦⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠉⠻⣿⣟⠿⠿⠿⠿⠿⣿⡇⢀⣾⠁⠀⠀⠀⠀⠐⠀⠀⠀⠀⠀⠀⢸⣿⠉⣿⡿⠿⣶⣄⡀⠀⣼⡆⠀⠀⠀⠙⢶⣤⣤⣾⣿⠇⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠈⠙⢷⣤⡀⠀⢀⣿⠁⣾⠇⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⢿⣆⡙⠿⠦⠄⢈⣽⣿⡿⠀⠀⣀⣤⣤⣤⣭⣛⣿⡟⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⢹⣿⣶⣾⠏⣸⡟⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣠⣬⠟⠛⠓⠶⣾⣿⣿⠟⠁⢠⡾⠟⠋⠉⣀⣠⣬⣭⣿⠿⣶⣦⡀⠀⣦⡀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⣾⣿⠉⠁⠀⣿⡇⠀⠀⠀⠀⠀⠀⠀⠀⢀⣴⣾⢿⣿⡿⠃⢀⣴⣶⣦⡀⠉⠀⠀⠀⢁⣀⡀⠒⠛⠛⠿⢿⣿⣿⠀⠀⠹⣿⣀⣿⢻⡆⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⢸⣿⡏⠀⠀⢰⣿⠁⠀⠀⠀⠀⠀⠀⢀⣾⢿⣿⠇⣼⣿⠃⠀⣼⣿⣿⡿⢿⣆⠀⠀⠀⠀⣿⠻⣷⡀⠀⠀⠀⠙⠃⠀⠀⠀⣿⣿⡏⢈⡇⠀⠀⠀
+⠀⠀⠀⠀⠀⢀⣀⣼⣿⣷⣆⠀⢸⣿⠀⠀⠀⠀⠀⠀⣰⠟⠁⢸⡿⠀⣿⡏⠀⢠⣿⣿⣿⣧⠀⠹⣆⠀⠀⣸⡿⠀⢹⣷⠀⠀⠀⣠⡀⠀⠀⣰⡿⠋⢀⣼⣷⣦⡀⠀
+⢀⣤⣴⣶⠿⠟⠛⠋⠉⠘⣿⠀⢸⣿⡀⠀⠀⠀⠀⣰⠏⠀⠀⣿⡇⠀⣿⠃⠀⢸⣿⣿⣿⣿⠀⢠⣿⣿⣿⣿⠃⣀⣠⣿⣷⣤⣴⣿⣷⣶⣿⣿⣶⣾⡿⠟⠃⠹⣿⡆
+⠀⠀⠉⠙⠻⠷⣶⣤⣄⣠⣿⠀⢸⣿⡇⠀⠀⠀⢰⡏⠀⠀⠀⢻⡇⠀⣿⠀⠀⢸⣿⣿⠙⣿⢠⣾⠇⢹⣿⣷⠿⠛⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠁⠀⠀⠀⠀⣿⡇
+⠀⠀⠀⠀⠀⠀⠀⠸⣿⣿⠋⠀⠈⣿⣧⠀⠀⠀⣿⠀⠀⠀⠀⢸⡇⠀⢿⡄⠀⢸⣿⡿⠀⢹⣿⡟⣠⡿⠋⣀⣠⣤⣤⣄⣀⣀⣀⣀⠀⠀⠀⠀⠀⠀⢀⣀⣠⣾⡿⠁
+⠀⠀⠀⠀⠀⠀⠀⠀⢿⣿⡄⠀⠀⢻⣿⡄⠀⢸⡇⠀⠀⠀⠀⠈⠃⠀⠸⡇⠀⢸⣏⠀⠀⠘⣿⣾⡏⠠⠚⠉⠁⠀⠀⠉⠉⠙⠛⠻⠿⠿⣿⣿⣿⡿⢿⣿⠉⠉⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠸⣿⣷⣠⣄⠘⣿⣧⠀⢸⠇⠀⠀⠀⠀⠀⠀⠀⠀⢹⠀⠀⢿⣦⣠⣼⣿⠏⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣼⡿⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⣹⣿⡿⠻⣷⡹⣿⣆⠸⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠃⠀⠈⢿⡏⠉⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣶⠏⣰⠇⠀⠀⣀⣤⣾⡿⠃⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⣠⣾⠟⠉⠀⠀⢹⣧⠹⣿⣆⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⠳⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣴⠟⢁⣴⠿⠶⠾⠿⠿⠟⠋⠁⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⣠⣾⣿⣥⣴⣶⡶⣶⣿⣿⠀⠹⣿⣆⠀⡄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠱⣤⣀⡀⠒⠚⢉⣠⣴⠟⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠈⠁⠀⠀⠀⠀⠀⠀⠈⠻⣿⣷⣄⠘⢿⣷⡈⠢⣀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣾⣿⣿⡿⠿⠿⠿⠟⠛⠉⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⠻⣿⣷⣦⣙⢿⣦⣌⠛⠶⣤⣤⣤⣤⣤⣤⡴⠀⣰⣿⣿⠏⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⠙⠿⣿⣷⣿⣿⣿⣶⣤⣉⡉⠉⠉⢉⣀⣴⣿⠟⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠉⠛⠻⠿⢿⣿⣿⣿⣿⠿⠿⠛⠉⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
 """
-    print(style(art, C.MAGENTA))
+    try:
+        print(style(art, C.MAGENTA))
+    except UnicodeEncodeError:
+        print()  # terminal encoding can't render the art — skip it
     print(style("                       ♥ SofiaVault ♥", C.BOLD, C.MAGENTA))
     print(style("                  Secure Password Manager", C.DIM))
     print()
@@ -777,6 +768,225 @@ def print_warn(msg: str):
 
 def print_info(msg: str):
     print(f"  {style(SYM_DOT, C.CYAN)} {msg}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Vault Transfer (export / import) & Wipe
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _clickable_path(path: Path) -> str:
+    """Render a filesystem path as an OSC 8 terminal hyperlink when possible."""
+    text = str(path)
+    if not C._enabled:
+        return text
+    return f"\033]8;;{path.as_uri()}\033\\{text}\033]8;;\033\\"
+
+
+def cmd_export():
+    """Show where the encrypted vault file lives so the user can copy it."""
+    if not DB_PATH.exists():
+        print()
+        print_error("No vault file found — nothing to export.")
+        print()
+        return
+
+    size_kb = DB_PATH.stat().st_size / 1024
+    print()
+    print(f"  {style(SYM_BOX_TOP + SYM_BOX_H * 44, C.DIM)}")
+    print(f"  {style(SYM_BOX_SIDE, C.DIM)} {style('Vault file', C.BOLD)}")
+    print(f"  {style(SYM_BOX_SIDE, C.DIM)}")
+    print(f"  {style(SYM_BOX_SIDE, C.DIM)} {style(_clickable_path(DB_PATH), C.CYAN, C.UNDERLINE)}")
+    print(f"  {style(SYM_BOX_SIDE, C.DIM)} {style(DB_PATH.as_uri(), C.DIM)}")
+    print(f"  {style(SYM_BOX_SIDE, C.DIM)} {style(f'{size_kb:.1f} KB', C.DIM)}")
+    print(f"  {style(SYM_BOX_BOT + SYM_BOX_H * 44, C.DIM)}")
+    print()
+    print_info("The file is fully encrypted — safe to copy to a USB drive or cloud.")
+    print_info("On the other device run: sofiavault import <path/to/vault.db>")
+    print_info("You'll need your master password to open it there.")
+    print()
+
+
+def _is_vault_file(path: Path) -> bool:
+    """True if the file looks like a SofiaVault database (v1 or v2)."""
+    try:
+        with open(path, 'rb') as f:
+            if not f.read(16).startswith(b"SQLite format 3"):
+                return False
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            cur = conn.execute(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='master'"
+            )
+            if cur.fetchone()[0] == 0:
+                return False
+            return conn.execute("SELECT COUNT(*) FROM master").fetchone()[0] > 0
+        finally:
+            conn.close()
+    except Exception:
+        return False
+
+
+def cmd_import_vault(src: str) -> bool:
+    """Replace the local vault with a vault file from another device.
+
+    Verifies the file is a real SofiaVault database AND that the user knows
+    its master password before anything is touched. An existing local vault
+    is backed up first. Returns True if the vault was replaced.
+    """
+    path = Path(src).expanduser().resolve()
+
+    if not path.exists():
+        print()
+        print_error(f"File not found: {path}")
+        print()
+        return False
+    if not _is_vault_file(path):
+        print()
+        print_error("That file is not a SofiaVault vault.")
+        print()
+        return False
+    if DB_PATH.exists() and path.samefile(DB_PATH):
+        print()
+        print_error("That is already the active vault.")
+        print()
+        return False
+
+    print()
+    print(f"  {style(_hr(), C.DIM)}")
+    print(f"  {style('Import Vault', C.BOLD)}  {style(str(path), C.CYAN)}")
+    print(f"  {style(_hr(), C.DIM)}")
+    print()
+
+    # Prove ownership of the imported vault before touching anything
+    password = get_master_password("Master password of the imported vault: ")
+    ro = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        key = _key_from_password(ro, password)
+    finally:
+        ro.close()
+    if key is None:
+        print_error("Wrong password for that vault. Nothing was changed.")
+        print()
+        return False
+
+    if DB_PATH.exists():
+        confirm = input(
+            f"  {style('!', C.YELLOW)} This will replace your current vault "
+            f"(a backup is kept). Continue? {style('[y/N]', C.DIM)}: "
+        ).strip().lower()
+        if confirm != 'y':
+            print_info("Cancelled. Nothing was changed.")
+            print()
+            return False
+        backup = DB_PATH.with_name(DB_PATH.name + ".replaced-backup")
+        shutil.copy2(DB_PATH, backup)
+        with contextlib.suppress(OSError):
+            os.chmod(backup, 0o600)
+        print_info(f"Previous vault backed up to {backup}")
+
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(path, DB_PATH)
+    _harden_storage_perms()
+
+    print()
+    print_success("Vault imported.")
+    print_info("Unlock it with the imported vault's master password.")
+    print()
+    return True
+
+
+def _wipe_targets() -> list[Path]:
+    """The explicit allowlist of files a wipe may touch — nothing else."""
+    return [
+        DB_PATH,
+        Path(str(DB_PATH) + "-wal"),
+        Path(str(DB_PATH) + "-journal"),
+        DB_PATH.with_name(DB_PATH.name + ".v1-backup"),
+        DB_PATH.with_name(DB_PATH.name + ".replaced-backup"),
+        HISTORY_PATH,
+    ]
+
+
+def _shred_file(path: Path, passes: int = 3):
+    """Overwrite a file with random data, then delete it.
+
+    Symlinks are unlinked without following, so a wipe can never scramble
+    a file outside the vault directory.
+    """
+    try:
+        if path.is_symlink():
+            path.unlink()
+            return
+        if not path.is_file():
+            return
+        size = path.stat().st_size
+        if size:
+            with open(path, 'r+b') as f:
+                for _ in range(passes):
+                    f.seek(0)
+                    remaining = size
+                    while remaining:
+                        chunk = min(1 << 20, remaining)
+                        f.write(secrets.token_bytes(chunk))
+                        remaining -= chunk
+                    f.flush()
+                    os.fsync(f.fileno())
+                f.seek(0)
+                f.truncate()
+                f.flush()
+                os.fsync(f.fileno())
+        # Hide the original filename as well
+        tmp = path.with_name(secrets.token_hex(8))
+        try:
+            path.rename(tmp)
+            tmp.unlink()
+        except OSError:
+            path.unlink()
+    except OSError:
+        with contextlib.suppress(OSError):
+            path.unlink()
+
+
+def cmd_wipe(session: "VaultSession"):
+    """Permanently destroy the vault. Exits the program on success."""
+    print()
+    print(f"  {style(_hr(), C.RED)}")
+    print(f"  {style('!  WIPE VAULT — THIS CANNOT BE UNDONE', C.BOLD, C.BRED)}")
+    print(f"  {style(_hr(), C.RED)}")
+    print("  Every stored password, all backups, and the command history")
+    print("  will be overwritten with random data and deleted.")
+    print()
+
+    password = get_master_password()
+    if _key_from_password(session.conn, password) is None:
+        print_error("Wrong password. Wipe cancelled — nothing was changed.")
+        print()
+        return
+
+    phrase = input(
+        f"  Type {style('wipe my vault', C.BOLD, C.RED)} to confirm: "
+    ).strip().lower()
+    if phrase != "wipe my vault":
+        print_info("Wipe cancelled — nothing was changed.")
+        print()
+        return
+
+    session.lock()
+    session.conn.close()
+
+    for target in _wipe_targets():
+        _shred_file(target)
+    with contextlib.suppress(OSError):
+        if DB_PATH.parent.name == '.sofiavault':
+            DB_PATH.parent.rmdir()
+
+    print()
+    print_success("Vault wiped. All entries are gone.")
+    print_info("Note: on SSDs and copy-on-write filesystems (e.g. APFS), software")
+    print_info("overwriting cannot guarantee physical erasure — full-disk")
+    print_info("encryption (FileVault/BitLocker/LUKS) is the reliable protection.")
+    print()
+    sys.exit(0)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -862,10 +1072,8 @@ def setup_master(conn: sqlite3.Connection) -> bytes:
     return key
 
 
-def unlock_vault(conn: sqlite3.Connection) -> Optional[bytes]:
-    """Unlock vault with master password"""
-    password = get_master_password()
-
+def _key_from_password(conn: sqlite3.Connection, password: str) -> Optional[bytes]:
+    """Derive and verify the master key. Returns None on wrong password."""
     combined_salt, stored_hash = get_master_data(conn)
     salt = combined_salt[:SALT_SIZE]
     verify_salt = combined_salt[SALT_SIZE:]
@@ -874,9 +1082,16 @@ def unlock_vault(conn: sqlite3.Connection) -> Optional[bytes]:
     verify_hash = derive_key(base64.b64encode(key).decode(), verify_salt)
 
     if not hmac.compare_digest(verify_hash, stored_hash):
-        print_error("Wrong password.")
         return None
+    return key
 
+
+def unlock_vault(conn: sqlite3.Connection) -> Optional[bytes]:
+    """Unlock vault with master password"""
+    password = get_master_password()
+    key = _key_from_password(conn, password)
+    if key is None:
+        print_error("Wrong password.")
     return key
 
 
@@ -1222,7 +1437,11 @@ def print_repl_help():
     print(f"  {style('delete', C.CYAN)} / {style('rm', C.CYAN)} "
           f"{style('<service>', C.DIM)}  Delete an entry")
     print(f"  {style('import', C.CYAN)} {style('<file>', C.DIM)}          "
-          f"Import from CSV")
+          f"Import a CSV or a vault file")
+    print(f"  {style('export', C.CYAN)}                 "
+          f"Show vault file location to copy")
+    print(f"  {style('wipe', C.CYAN)}                   "
+          f"Destroy the vault permanently")
     print(f"  {style('help', C.CYAN)}                   "
           f"Show this help")
     print(f"  {style('exit', C.CYAN)} / {style('quit', C.CYAN)}            "
@@ -1251,7 +1470,11 @@ def print_oneshot_help():
     print(f"  sofiavault {style('delete', C.CYAN)} {style('<service>', C.DIM)}     "
           f"{style('Delete an entry', C.DIM)}")
     print(f"  sofiavault {style('import', C.CYAN)} {style('<file>', C.DIM)}        "
-          f"{style('Import from CSV', C.DIM)}")
+          f"{style('Import a CSV or a vault file', C.DIM)}")
+    print(f"  sofiavault {style('export', C.CYAN)}               "
+          f"{style('Show vault file location', C.DIM)}")
+    print(f"  sofiavault {style('wipe', C.CYAN)}                 "
+          f"{style('Destroy the vault permanently', C.DIM)}")
     print(f"  sofiavault {style('help', C.CYAN)}                 "
           f"{style('Show this help', C.DIM)}")
     print()
@@ -1342,11 +1565,26 @@ class VaultREPL(cmd.Cmd):
     do_rm = do_delete
 
     def do_import(self, arg: str):
-        """Import from CSV: import <file>"""
-        if not arg.strip():
-            print_info("Usage: import <path/to/file.csv>")
+        """Import a CSV or a vault file from another device: import <file>"""
+        target = arg.strip()
+        if not target:
+            print_info("Usage: import <path/to/file.csv>  (or a vault.db file)")
             return
-        cmd_import(self.session, arg.strip())
+        if _is_vault_file(Path(target).expanduser()):
+            if cmd_import_vault(target):
+                print(f"  {style('Restart SofiaVault to unlock the imported vault.', C.DIM)}")
+                print()
+                return True  # exit the REPL — the old session is stale
+            return
+        cmd_import(self.session, target)
+
+    def do_export(self, _arg: str):
+        """Show the vault file location for copying to another device"""
+        cmd_export()
+
+    def do_wipe(self, _arg: str):
+        """Permanently destroy the vault (asks for password + confirmation)"""
+        cmd_wipe(self.session)
 
     def do_help(self, arg: str):
         """Show help"""
@@ -1431,6 +1669,13 @@ def _warn_corrupt(session: VaultSession):
 
 def _run_oneshot(args: list[str]):
     """Run a single command and exit (backward-compatible mode)."""
+    # Importing a vault file must work on a fresh device with no local
+    # vault, so it runs before (and instead of) unlocking the local one.
+    if args[0].lower() == 'import' and len(args) > 1 \
+            and _is_vault_file(Path(args[1]).expanduser()):
+        cmd_import_vault(args[1])
+        return
+
     conn, key = _open_vault(show_banner_on_setup=True)
     session = VaultSession(conn, key)
     _warn_corrupt(session)
@@ -1451,6 +1696,10 @@ def _run_oneshot(args: list[str]):
             cmd_import(session, args[1])
         else:
             print_info("Usage: sofiavault import <path/to/file.csv>")
+    elif command == 'export':
+        cmd_export()
+    elif command == 'wipe':
+        cmd_wipe(session)
     elif command in ('delete', 'del', 'rm'):
         if len(args) > 1:
             cmd_delete(session, args[1])

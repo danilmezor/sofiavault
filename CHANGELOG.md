@@ -2,6 +2,28 @@
 
 All notable changes to SofiaVault will be documented in this file.
 
+## [0.2.2] - 2026-08-02
+
+### Added
+- **Multi-device support**:
+  - `export` — shows the vault file location as a clickable terminal link;
+    the file is fully encrypted and safe to copy between machines.
+  - `import <vault.db>` — the import command now auto-detects vault files
+    (vs CSV) and installs them: verifies the imported vault's master password
+    before touching anything, backs up any existing local vault to
+    `vault.db.replaced-backup`, and works on fresh devices with no vault yet.
+    Old-format (v1) vaults are upgraded automatically on first unlock.
+  - `wipe` — permanently destroys the vault: requires the master password
+    plus a typed confirmation phrase, then overwrites vault, backups, and
+    history with 3 passes of random data before deleting. Only an explicit
+    allowlist of SofiaVault's own files is touched; symlinks are never
+    followed. See SECURITY.md for SSD/copy-on-write caveats.
+
+### Changed
+- New banner artwork: the guardian bulldog in its doghouse is now drawn in
+  high-resolution Braille-block characters and is actually recognizable.
+  Falls back to a plain banner on terminals that can't encode the glyphs.
+
 ## [0.2.1] - 2026-08-02
 
 ### Added
