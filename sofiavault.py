@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
 SofiaVault - A secure terminal password manager
-Uses Argon2 for key derivation and AES-256-GCM for encryption
+Uses Argon2 for master key derivation, HKDF-SHA256 for per-entry keys,
+and AES-256-GCM for encryption. All entry data (service, username, URL,
+password) is stored inside a single authenticated ciphertext per entry.
 """
 
 import base64
@@ -9,6 +11,8 @@ import cmd
 import contextlib
 import csv
 import getpass
+import hmac
+import json
 import os
 import secrets
 import shutil
@@ -16,12 +20,15 @@ import sqlite3
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
 try:
     from argon2.low_level import Type, hash_secret_raw
+    from cryptography.hazmat.primitives import hashes
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
     from rapidfuzz import fuzz, process
 except ImportError:
     print("Missing dependencies. Run:")
@@ -42,19 +49,23 @@ SALT_SIZE = 16
 NONCE_SIZE = 12
 KEY_SIZE = 32  # 256 bits for AES-256
 AUTO_LOCK_SECONDS = 300  # 5 minutes
+CLIPBOARD_CLEAR_SECONDS = 45
+
+# Domain-separation constant: HKDF info and GCM associated data for v2 entries
+ENTRY_CONTEXT = b"sofiavault-entry-v2"
 
 # Box drawing and symbol characters (extracted for Python 3.9 f-string compat)
-SYM_BOX_TOP = "\u250c"      # ┌
-SYM_BOX_SIDE = "\u2502"     # │
-SYM_BOX_BOT = "\u2514"      # └
-SYM_BOX_H = "\u2500"        # ─
-SYM_CHECK = "\u2713"        # ✓
-SYM_CROSS = "\u2717"        # ✗
-SYM_BULLET = "\u2022"       # •
-SYM_SKIP = "\u2298"         # ⊘
+SYM_BOX_TOP = "┌"      # ┌
+SYM_BOX_SIDE = "│"     # │
+SYM_BOX_BOT = "└"      # └
+SYM_BOX_H = "─"        # ─
+SYM_CHECK = "✓"        # ✓
+SYM_CROSS = "✗"        # ✗
+SYM_BULLET = "•"       # •
+SYM_SKIP = "⊘"         # ⊘
 SYM_HEART = "♥"        # ♥
-SYM_ARROWS = "\u2191\u2193" # ↑↓
-SYM_DOT = "\u00b7"          # ·
+SYM_ARROWS = "↑↓" # ↑↓
+SYM_DOT = "·"          # ·
 SYM_DASH = "—"         # —
 
 
@@ -127,18 +138,32 @@ def derive_key(master_password: str, salt: bytes) -> bytes:
     )
 
 
-def encrypt(plaintext: str, key: bytes) -> tuple[bytes, bytes]:
+def derive_entry_key(master_key: bytes, salt: bytes) -> bytes:
+    """Derive a per-entry key from the master key using HKDF-SHA256.
+
+    The master key already has full entropy (Argon2 output), so a fast
+    KDF is the correct tool here — no need for a memory-hard pass per entry.
+    """
+    return HKDF(
+        algorithm=hashes.SHA256(),
+        length=KEY_SIZE,
+        salt=salt,
+        info=ENTRY_CONTEXT,
+    ).derive(master_key)
+
+
+def encrypt(plaintext: str, key: bytes, aad: Optional[bytes] = None) -> tuple[bytes, bytes]:
     """Encrypt plaintext with AES-256-GCM. Returns (nonce, ciphertext)"""
     nonce = secrets.token_bytes(NONCE_SIZE)
     aesgcm = AESGCM(key)
-    ciphertext = aesgcm.encrypt(nonce, plaintext.encode('utf-8'), None)
+    ciphertext = aesgcm.encrypt(nonce, plaintext.encode('utf-8'), aad)
     return nonce, ciphertext
 
 
-def decrypt(nonce: bytes, ciphertext: bytes, key: bytes) -> str:
+def decrypt(nonce: bytes, ciphertext: bytes, key: bytes, aad: Optional[bytes] = None) -> str:
     """Decrypt ciphertext with AES-256-GCM"""
     aesgcm = AESGCM(key)
-    plaintext = aesgcm.decrypt(nonce, ciphertext, None)
+    plaintext = aesgcm.decrypt(nonce, ciphertext, aad)
     return plaintext.decode('utf-8')
 
 
@@ -165,14 +190,92 @@ def copy_to_clipboard(text: str) -> bool:
         return False
 
 
+# Runs in a detached child process: waits, then clears the clipboard only if
+# it still holds the copied password (never clobbers newer clipboard content).
+_CLIP_CLEAR_SOURCE = (
+    "import subprocess, sys, time\n"
+    "secret = sys.stdin.buffer.read().decode('utf-8', 'replace')\n"
+    "time.sleep(float(sys.argv[1]))\n"
+    "if sys.platform == 'darwin':\n"
+    "    read_cmd, write_cmd = ['pbpaste'], ['pbcopy']\n"
+    "elif sys.platform.startswith('linux'):\n"
+    "    read_cmd = ['xclip', '-selection', 'clipboard', '-o']\n"
+    "    write_cmd = ['xclip', '-selection', 'clipboard']\n"
+    "elif sys.platform == 'win32':\n"
+    "    read_cmd = ['powershell', '-NoProfile', '-Command', 'Get-Clipboard']\n"
+    "    write_cmd = ['clip']\n"
+    "else:\n"
+    "    sys.exit(0)\n"
+    "try:\n"
+    "    out = subprocess.run(read_cmd, capture_output=True, timeout=10).stdout\n"
+    "except Exception:\n"
+    "    sys.exit(0)\n"
+    "current = out.decode('utf-8', 'replace')\n"
+    "if current.rstrip('\\r\\n') != secret.rstrip('\\r\\n'):\n"
+    "    sys.exit(0)\n"
+    "try:\n"
+    "    subprocess.run(write_cmd, input=b'', capture_output=True, timeout=10)\n"
+    "except Exception:\n"
+    "    pass\n"
+)
+
+
+def schedule_clipboard_clear(secret: str, delay: int = CLIPBOARD_CLEAR_SECONDS) -> bool:
+    """Spawn a detached process that clears the clipboard after `delay` seconds.
+
+    Detached so it survives one-shot mode exiting immediately. The secret is
+    passed via stdin, never argv, so it is not visible in the process list.
+    """
+    try:
+        kwargs = {}
+        if sys.platform == 'win32':
+            detached = getattr(subprocess, 'DETACHED_PROCESS', 0x8)
+            new_group = getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0x200)
+            kwargs['creationflags'] = detached | new_group
+        else:
+            kwargs['start_new_session'] = True
+        proc = subprocess.Popen(
+            [sys.executable, '-c', _CLIP_CLEAR_SOURCE, str(delay)],
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, **kwargs
+        )
+        proc.stdin.write(secret.encode('utf-8'))
+        proc.stdin.close()
+        return True
+    except Exception:
+        return False
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Database Functions
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _harden_storage_perms():
+    """Restrict vault directory/files to the owning user (POSIX).
+
+    Also repairs permissions of vaults created by older versions.
+    The directory is only touched when it is the real ~/.sofiavault dir,
+    so tests pointing DB_PATH at a temp dir never chmod shared locations.
+    """
+    with contextlib.suppress(OSError):
+        if DB_PATH.parent.name == '.sofiavault':
+            os.chmod(DB_PATH.parent, 0o700)
+    with contextlib.suppress(OSError):
+        if DB_PATH.exists():
+            os.chmod(DB_PATH, 0o600)
+    with contextlib.suppress(OSError):
+        if HISTORY_PATH.exists():
+            os.chmod(HISTORY_PATH, 0o600)
+
+
 def init_db() -> sqlite3.Connection:
     """Initialize database and return connection"""
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _harden_storage_perms()
     conn = sqlite3.connect(str(DB_PATH))
+    # Overwrite deleted content with zeros so removed entries (and migrated
+    # legacy plaintext) don't linger in the database file's free pages.
+    conn.execute("PRAGMA secure_delete = ON")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS master (
             id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -180,25 +283,21 @@ def init_db() -> sqlite3.Connection:
             verify_hash BLOB NOT NULL
         )
     """)
+    # v2 entries: all fields (service, username, url, password, created_at)
+    # live inside one authenticated AES-GCM blob. No plaintext metadata,
+    # and nothing an attacker can relabel or swap between rows.
     conn.execute("""
-        CREATE TABLE IF NOT EXISTS entries (
+        CREATE TABLE IF NOT EXISTS entries_v2 (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            service TEXT NOT NULL,
-            username TEXT NOT NULL,
-            url TEXT DEFAULT '',
             salt BLOB NOT NULL,
             nonce BLOB NOT NULL,
-            encrypted_password BLOB NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            blob BLOB NOT NULL
         )
     """)
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_service ON entries(service)")
-
-    # Migration: add url column if missing (for existing databases)
-    with contextlib.suppress(sqlite3.OperationalError):
-        conn.execute("ALTER TABLE entries ADD COLUMN url TEXT DEFAULT ''")
-
+    conn.execute("CREATE TABLE IF NOT EXISTS vault_meta (key TEXT PRIMARY KEY, value TEXT)")
+    conn.execute("INSERT OR REPLACE INTO vault_meta (key, value) VALUES ('schema_version', '2')")
     conn.commit()
+    _harden_storage_perms()
     return conn
 
 
@@ -224,37 +323,180 @@ def get_master_data(conn: sqlite3.Connection) -> tuple[bytes, bytes]:
     return row[0], row[1]
 
 
-def save_entry(conn: sqlite3.Connection, service: str, username: str,
-               salt: bytes, nonce: bytes, encrypted_password: bytes, url: str = ''):
-    """Save a password entry"""
-    conn.execute(
-        """INSERT INTO entries (service, username, url, salt, nonce, encrypted_password)
-           VALUES (?, ?, ?, ?, ?, ?)""",
-        (service.lower(), username, url, salt, nonce, encrypted_password)
-    )
-    conn.commit()
+@dataclass
+class VaultEntry:
+    """Decrypted entry metadata held in memory while the vault is unlocked."""
+    id: int
+    service: str
+    username: str
+    url: str
 
 
-def get_all_services(conn: sqlite3.Connection) -> list[tuple[int, str, str]]:
-    """Get all services with their IDs and usernames"""
-    cur = conn.execute("SELECT id, service, username FROM entries ORDER BY service")
-    return cur.fetchall()
+def save_entry(conn: sqlite3.Connection, key: bytes, service: str, username: str,
+               password: str, url: str = '', created_at: Optional[str] = None,
+               commit: bool = True) -> int:
+    """Encrypt and save a password entry. Returns the new row id."""
+    if created_at is None:
+        created_at = time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())
+    payload = json.dumps({
+        'service': service.lower().strip(),
+        'username': username,
+        'url': url,
+        'password': password,
+        'created_at': created_at,
+    }, ensure_ascii=False)
 
+    entry_salt = secrets.token_bytes(SALT_SIZE)
+    entry_key = derive_entry_key(key, entry_salt)
+    nonce, blob = encrypt(payload, entry_key, aad=ENTRY_CONTEXT)
 
-def get_entry_by_service(conn: sqlite3.Connection, service: str) -> Optional[tuple]:
-    """Get entry by exact service name"""
     cur = conn.execute(
-        "SELECT id, service, username, url, salt, nonce, encrypted_password "
-        "FROM entries WHERE service = ?",
-        (service.lower(),)
+        "INSERT INTO entries_v2 (salt, nonce, blob) VALUES (?, ?, ?)",
+        (entry_salt, nonce, blob)
     )
-    return cur.fetchone()
+    if commit:
+        conn.commit()
+    return cur.lastrowid
+
+
+def _decrypt_entry_row(key: bytes, salt: bytes, nonce: bytes, blob: bytes) -> dict:
+    """Decrypt one entry blob to its dict payload. Raises on tampering/corruption."""
+    entry_key = derive_entry_key(key, salt)
+    return json.loads(decrypt(nonce, blob, entry_key, aad=ENTRY_CONTEXT))
+
+
+def load_entries(conn: sqlite3.Connection, key: bytes) -> tuple[list[VaultEntry], int]:
+    """Decrypt metadata for all entries. Returns (entries, corrupt_count)."""
+    entries = []
+    corrupt = 0
+    cur = conn.execute("SELECT id, salt, nonce, blob FROM entries_v2")
+    for row_id, salt, nonce, blob in cur.fetchall():
+        try:
+            data = _decrypt_entry_row(key, salt, nonce, blob)
+            entries.append(VaultEntry(
+                id=row_id,
+                service=data.get('service', ''),
+                username=data.get('username', ''),
+                url=data.get('url', ''),
+            ))
+        except Exception:
+            corrupt += 1
+    entries.sort(key=lambda e: e.service)
+    return entries, corrupt
+
+
+def get_password(conn: sqlite3.Connection, key: bytes, entry_id: int) -> Optional[str]:
+    """Decrypt and return the password for one entry, or None on failure."""
+    cur = conn.execute("SELECT salt, nonce, blob FROM entries_v2 WHERE id = ?", (entry_id,))
+    row = cur.fetchone()
+    if row is None:
+        return None
+    try:
+        return _decrypt_entry_row(key, row[0], row[1], row[2])['password']
+    except Exception:
+        return None
+
+
+def get_entry_by_service(entries: list[VaultEntry], service: str) -> Optional[VaultEntry]:
+    """Find an entry by exact service name in the decrypted index."""
+    target = service.lower().strip()
+    for entry in entries:
+        if entry.service == target:
+            return entry
+    return None
 
 
 def delete_entry(conn: sqlite3.Connection, entry_id: int):
     """Delete entry by ID"""
-    conn.execute("DELETE FROM entries WHERE id = ?", (entry_id,))
+    conn.execute("DELETE FROM entries_v2 WHERE id = ?", (entry_id,))
     conn.commit()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Legacy (v1) Migration
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
+    cur = conn.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)
+    )
+    return cur.fetchone()[0] > 0
+
+
+def migrate_legacy_vault(conn: sqlite3.Connection, key: bytes) -> None:
+    """Upgrade a v1 vault (plaintext metadata, Argon2 entry keys) to v2.
+
+    Runs automatically after unlock. Safety properties:
+      - The original database file is backed up (once) before anything changes.
+      - All re-encryption happens in a single transaction; a crash or error
+        rolls back and leaves the vault exactly as it was.
+      - Entries that fail to decrypt (already corrupt in v1) are left in the
+        legacy table untouched and reported — never silently dropped.
+    """
+    if not _table_exists(conn, 'entries'):
+        return
+
+    # Very old v1 databases may lack the url column
+    with contextlib.suppress(sqlite3.OperationalError):
+        conn.execute("ALTER TABLE entries ADD COLUMN url TEXT DEFAULT ''")
+
+    rows = conn.execute(
+        "SELECT id, service, username, url, salt, nonce, encrypted_password, created_at "
+        "FROM entries"
+    ).fetchall()
+
+    if not rows:
+        conn.execute("DROP TABLE entries")
+        conn.commit()
+        return
+
+    backup = DB_PATH.with_name(DB_PATH.name + ".v1-backup")
+    if DB_PATH.exists() and not backup.exists():
+        shutil.copy2(DB_PATH, backup)
+        with contextlib.suppress(OSError):
+            os.chmod(backup, 0o600)
+
+    print()
+    print_info(f"Upgrading vault to encrypted-metadata format ({len(rows)} entries)...")
+    print_info("This is a one-time step and may take a moment.")
+
+    failed = []
+    try:
+        for i, (row_id, service, username, url, salt, nonce, enc, created_at) in enumerate(
+            rows, 1
+        ):
+            legacy_key = derive_key(base64.b64encode(key).decode(), salt)
+            try:
+                password = decrypt(nonce, enc, legacy_key)
+            except Exception:
+                failed.append(service)
+                continue
+            save_entry(conn, key, service, username, password, url or '',
+                       created_at=str(created_at or ''), commit=False)
+            conn.execute("DELETE FROM entries WHERE id = ?", (row_id,))
+            if i % 20 == 0:
+                print_info(f"  {i}/{len(rows)}...")
+        if not failed:
+            conn.execute("DROP TABLE entries")
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+
+    # Rewrite the database file so freed pages holding v1 plaintext metadata
+    # are physically removed, not just marked unused.
+    conn.execute("VACUUM")
+
+    migrated = len(rows) - len(failed)
+    if failed:
+        print_warn(f"Migrated {migrated}/{len(rows)} entries. "
+                   f"{len(failed)} could not be decrypted and were left untouched: "
+                   f"{', '.join(failed)}")
+        print_warn(f"Original vault backup: {backup}")
+    else:
+        print_success(f"Vault upgraded {SYM_DASH} {migrated} entries re-encrypted.")
+        print_info(f"Backup of the original vault: {backup}")
+    print()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -262,24 +504,20 @@ def delete_entry(conn: sqlite3.Connection, entry_id: int):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def fuzzy_find_service(
-    conn: sqlite3.Connection, query: str, threshold: int = 60
-) -> list[tuple]:
-    """Find services matching query using fuzzy matching"""
-    services = get_all_services(conn)
-    if not services:
+    entries: list[VaultEntry], query: str, threshold: int = 60
+) -> list[tuple[VaultEntry, int]]:
+    """Find entries matching query using fuzzy matching on the decrypted index."""
+    if not entries:
         return []
 
-    service_names = [s[1] for s in services]
-    matches = process.extract(query.lower(), service_names, scorer=fuzz.ratio, limit=5)
+    names = [e.service for e in entries]
+    matches = process.extract(query.lower(), names, scorer=fuzz.ratio, limit=5)
 
-    results = []
-    for match_name, score, _ in matches:
-        if score >= threshold:
-            for s in services:
-                if s[1] == match_name:
-                    results.append((s, score))
-                    break
-
+    results = [
+        (entries[idx], score)
+        for _name, score, idx in matches
+        if score >= threshold
+    ]
     return sorted(results, key=lambda x: x[1], reverse=True)
 
 
@@ -291,7 +529,7 @@ def _terminal_width() -> int:
     return shutil.get_terminal_size((80, 24)).columns
 
 
-def _hr(char: str = "\u2500") -> str:
+def _hr(char: str = "─") -> str:
     return char * min(_terminal_width(), 60)
 
 
@@ -343,8 +581,13 @@ def print_banner():
 
 
 def print_entry(service: str, username: str, url: str, password: str,
-                match_score: int = 0):
-    """Print a password entry with nice formatting."""
+                match_score: int = 0, show_password: bool = False):
+    """Print a password entry with nice formatting.
+
+    By default the password is copied to the clipboard (auto-cleared after
+    CLIPBOARD_CLEAR_SECONDS) and hidden on screen. It is only printed when
+    show_password is True, or as a fallback when no clipboard is available.
+    """
     print()
     print(f"  {style(SYM_BOX_TOP + SYM_BOX_H * 44, C.DIM)}")
 
@@ -362,13 +605,28 @@ def print_entry(service: str, username: str, url: str, password: str,
         print(f"  {style(SYM_BOX_SIDE, C.DIM)} {style('URL     ', C.DIM)} "
               f"{style(url, C.UNDERLINE)}")
 
-    print(f"  {style(SYM_BOX_SIDE, C.DIM)} {style('Pass    ', C.DIM)} "
-          f"{style(password, C.BOLD, C.GREEN)}")
-
     copied = copy_to_clipboard(password)
+    clearing = copied and schedule_clipboard_clear(password)
+
+    if show_password or not copied:
+        print(f"  {style(SYM_BOX_SIDE, C.DIM)} {style('Pass    ', C.DIM)} "
+              f"{style(password, C.BOLD, C.GREEN)}")
+    else:
+        print(f"  {style(SYM_BOX_SIDE, C.DIM)} {style('Pass    ', C.DIM)} "
+              f"{style(SYM_BULLET * 12, C.DIM)}")
+
+    print(f"  {style(SYM_BOX_SIDE, C.DIM)}")
     if copied:
-        print(f"  {style(SYM_BOX_SIDE, C.DIM)}")
-        print(f"  {style(SYM_BOX_SIDE, C.DIM)} {style('Copied to clipboard', C.DIM, C.GREEN)}")
+        note = "Copied to clipboard"
+        if clearing:
+            note += f" {SYM_DOT} clears in {CLIPBOARD_CLEAR_SECONDS}s"
+        print(f"  {style(SYM_BOX_SIDE, C.DIM)} {style(note, C.DIM, C.GREEN)}")
+        if not show_password:
+            hint = f"'show {service}' to display it"
+            print(f"  {style(SYM_BOX_SIDE, C.DIM)} {style(hint, C.DIM)}")
+    else:
+        warn = "Clipboard unavailable — password shown above"
+        print(f"  {style(SYM_BOX_SIDE, C.DIM)} {style(warn, C.DIM, C.YELLOW)}")
 
     print(f"  {style(SYM_BOX_BOT + SYM_BOX_H * 44, C.DIM)}")
     print()
@@ -388,6 +646,43 @@ def print_warn(msg: str):
 
 def print_info(msg: str):
     print(f"  {style(SYM_DOT, C.CYAN)} {msg}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Vault Session
+# ─────────────────────────────────────────────────────────────────────────────
+
+class VaultSession:
+    """Holds the active vault connection, derived key, and decrypted index."""
+
+    def __init__(self, conn: sqlite3.Connection, key: Optional[bytes]):
+        self.conn = conn
+        self.key = key
+        self.entries: list[VaultEntry] = []
+        self.corrupt_count = 0
+        self.last_activity = time.time()
+        if key is not None:
+            self.reload()
+
+    def reload(self):
+        """Rebuild the decrypted metadata index from the database."""
+        self.entries, self.corrupt_count = load_entries(self.conn, self.key)
+
+    def lock(self):
+        """Drop the key and all decrypted data from memory."""
+        self.key = None
+        self.entries = []
+
+    def unlock_with(self, key: bytes):
+        self.key = key
+        self.reload()
+        self.touch()
+
+    def touch(self):
+        self.last_activity = time.time()
+
+    def is_expired(self) -> bool:
+        return time.time() - self.last_activity > AUTO_LOCK_SECONDS
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -447,14 +742,26 @@ def unlock_vault(conn: sqlite3.Connection) -> Optional[bytes]:
     key = derive_key(password, salt)
     verify_hash = derive_key(base64.b64encode(key).decode(), verify_salt)
 
-    if verify_hash != stored_hash:
+    if not hmac.compare_digest(verify_hash, stored_hash):
         print_error("Wrong password.")
         return None
 
     return key
 
 
-def cmd_add(conn: sqlite3.Connection, key: bytes):
+def _reveal_entry(session: VaultSession, entry: VaultEntry,
+                  match_score: int = 0, show: bool = False):
+    """Decrypt and display one entry, handling corruption gracefully."""
+    password = get_password(session.conn, session.key, entry.id)
+    if password is None:
+        print_error(f"Decryption failed for '{entry.service}'. "
+                    "The entry may be corrupted or tampered with.")
+        return
+    print_entry(entry.service, entry.username, entry.url, password,
+                match_score=match_score, show_password=show)
+
+
+def cmd_add(session: VaultSession):
     """Add a new password entry"""
     print()
     print(f"  {style(_hr(), C.DIM)}")
@@ -468,7 +775,7 @@ def cmd_add(conn: sqlite3.Connection, key: bytes):
         return
 
     # Check if exists
-    existing = get_entry_by_service(conn, service)
+    existing = get_entry_by_service(session.entries, service)
     if existing:
         confirm = input(
             f"  {style('!', C.YELLOW)} '{service}' already exists. "
@@ -477,7 +784,7 @@ def cmd_add(conn: sqlite3.Connection, key: bytes):
         if confirm != 'y':
             print_info("Cancelled.")
             return
-        delete_entry(conn, existing[0])
+        delete_entry(session.conn, existing.id)
 
     username = input(f"  {style('Username/Email', C.DIM)}: ").strip()
     if not username:
@@ -489,34 +796,23 @@ def cmd_add(conn: sqlite3.Connection, key: bytes):
         print_error("Password required.")
         return
 
-    # Encrypt with a unique salt for this entry
-    entry_salt = secrets.token_bytes(SALT_SIZE)
-    entry_key = derive_key(base64.b64encode(key).decode(), entry_salt)
-    nonce, encrypted = encrypt(password, entry_key)
-
-    save_entry(conn, service, username, entry_salt, nonce, encrypted)
+    save_entry(session.conn, session.key, service, username, password)
+    session.reload()
     print()
     print_success(f"Saved {style(service, C.CYAN)} for {username}")
     print()
 
 
-def cmd_get(conn: sqlite3.Connection, key: bytes, query: str):
+def cmd_get(session: VaultSession, query: str, show: bool = False):
     """Get password for a service (fuzzy matched)"""
     # Try exact match first
-    exact = get_entry_by_service(conn, query)
+    exact = get_entry_by_service(session.entries, query)
     if exact:
-        _entry_id, service, username, url, salt, nonce, encrypted = exact
-        entry_key = derive_key(base64.b64encode(key).decode(), salt)
-        try:
-            password = decrypt(nonce, encrypted, entry_key)
-            print_entry(service, username, url, password)
-            return
-        except Exception:
-            print_error("Decryption failed. Database may be corrupted.")
-            return
+        _reveal_entry(session, exact, show=show)
+        return
 
     # Fuzzy match
-    matches = fuzzy_find_service(conn, query)
+    matches = fuzzy_find_service(session.entries, query)
 
     if not matches:
         print()
@@ -528,15 +824,8 @@ def cmd_get(conn: sqlite3.Connection, key: bytes, query: str):
     if len(matches) == 1 and matches[0][1] >= 80:
         # High confidence single match
         entry, score = matches[0]
-        _entry_id, service, username = entry
-
-        full_entry = get_entry_by_service(conn, service)
-        if full_entry:
-            _, _, _, url, salt, nonce, encrypted = full_entry
-            entry_key = derive_key(base64.b64encode(key).decode(), salt)
-            password = decrypt(nonce, encrypted, entry_key)
-            print_entry(service, username, url, password, match_score=score)
-            return
+        _reveal_entry(session, entry, match_score=score, show=show)
+        return
 
     # Multiple matches or low confidence - ask user
     print()
@@ -546,8 +835,8 @@ def cmd_get(conn: sqlite3.Connection, key: bytes, query: str):
     print()
     for i, (entry, score) in enumerate(matches, 1):
         score_color = C.GREEN if score >= 80 else C.YELLOW if score >= 60 else C.RED
-        print(f"  {style(f'[{i}]', C.BOLD)} {entry[1]} "
-              f"{style(f'({entry[2]})', C.DIM)}  "
+        print(f"  {style(f'[{i}]', C.BOLD)} {entry.service} "
+              f"{style(f'({entry.username})', C.DIM)}  "
               f"{style(f'{score}%', score_color)}")
 
     print(f"  {style('[0]', C.DIM)} Cancel")
@@ -561,21 +850,16 @@ def cmd_get(conn: sqlite3.Connection, key: bytes, query: str):
         idx = int(choice) - 1
         if 0 <= idx < len(matches):
             entry, _ = matches[idx]
-            full_entry = get_entry_by_service(conn, entry[1])
-            if full_entry:
-                _, service, username, url, salt, nonce, encrypted = full_entry
-                entry_key = derive_key(base64.b64encode(key).decode(), salt)
-                password = decrypt(nonce, encrypted, entry_key)
-                print_entry(service, username, url, password)
+            _reveal_entry(session, entry, show=show)
     except (ValueError, IndexError):
         print_error("Invalid selection.")
 
 
-def cmd_list(conn: sqlite3.Connection):
+def cmd_list(session: VaultSession):
     """List all stored services"""
-    services = get_all_services(conn)
+    entries = session.entries
 
-    if not services:
+    if not entries:
         print()
         print_info("No passwords saved yet.")
         print_info("Use 'add' to store your first one. ♥")
@@ -585,18 +869,22 @@ def cmd_list(conn: sqlite3.Connection):
     print()
     print(f"  {style(_hr(), C.DIM)}")
     print(f"  {style('Your Passwords', C.BOLD)}  "
-          f"{style(f'({len(services)})', C.DIM)}")
+          f"{style(f'({len(entries)})', C.DIM)}")
     print(f"  {style(_hr(), C.DIM)}")
     print()
-    for _, service, username in services:
-        print(f"  {style(SYM_BULLET, C.CYAN)} {style(service, C.BOLD)}"
-              f"  {style(username, C.DIM)}")
+    for entry in entries:
+        print(f"  {style(SYM_BULLET, C.CYAN)} {style(entry.service, C.BOLD)}"
+              f"  {style(entry.username, C.DIM)}")
     print()
+    if session.corrupt_count:
+        print_warn(f"{session.corrupt_count} entries could not be decrypted "
+                   "and are not shown.")
+        print()
 
 
-def cmd_delete(conn: sqlite3.Connection, query: str):
+def cmd_delete(session: VaultSession, query: str):
     """Delete an entry"""
-    matches = fuzzy_find_service(conn, query, threshold=70)
+    matches = fuzzy_find_service(session.entries, query, threshold=70)
 
     if not matches:
         print()
@@ -608,12 +896,13 @@ def cmd_delete(conn: sqlite3.Connection, query: str):
         entry, _score = matches[0]
         confirm = input(
             f"  {style('!', C.YELLOW)} Delete "
-            f"'{style(entry[1], C.BOLD)}' ({entry[2]})? "
+            f"'{style(entry.service, C.BOLD)}' ({entry.username})? "
             f"{style('[y/N]', C.DIM)}: "
         ).strip().lower()
         if confirm == 'y':
-            delete_entry(conn, entry[0])
-            print_success(f"Deleted '{entry[1]}'")
+            delete_entry(session.conn, entry.id)
+            session.reload()
+            print_success(f"Deleted '{entry.service}'")
         print()
         return
 
@@ -621,8 +910,8 @@ def cmd_delete(conn: sqlite3.Connection, query: str):
     print(f"  {style('Multiple matches for', C.DIM)} '{style(query, C.CYAN)}':")
     print()
     for i, (entry, _score) in enumerate(matches, 1):
-        print(f"  {style(f'[{i}]', C.BOLD)} {entry[1]} "
-              f"{style(f'({entry[2]})', C.DIM)}")
+        print(f"  {style(f'[{i}]', C.BOLD)} {entry.service} "
+              f"{style(f'({entry.username})', C.DIM)}")
     print(f"  {style('[0]', C.DIM)} Cancel")
     print()
 
@@ -636,18 +925,19 @@ def cmd_delete(conn: sqlite3.Connection, query: str):
             entry, _ = matches[idx]
             confirm = input(
                 f"  {style('!', C.YELLOW)} Delete "
-                f"'{style(entry[1], C.BOLD)}'? "
+                f"'{style(entry.service, C.BOLD)}'? "
                 f"{style('[y/N]', C.DIM)}: "
             ).strip().lower()
             if confirm == 'y':
-                delete_entry(conn, entry[0])
-                print_success(f"Deleted '{entry[1]}'")
+                delete_entry(session.conn, entry.id)
+                session.reload()
+                print_success(f"Deleted '{entry.service}'")
             print()
     except (ValueError, IndexError):
         print_error("Invalid selection.")
 
 
-def cmd_import(conn: sqlite3.Connection, key: bytes, csv_path: str):
+def cmd_import(session: VaultSession, csv_path: str):
     """Import passwords from a CSV file"""
     path = Path(csv_path).expanduser().resolve()
 
@@ -672,6 +962,8 @@ def cmd_import(conn: sqlite3.Connection, key: bytes, csv_path: str):
     imported = 0
     skipped = 0
     errors = 0
+
+    existing_services = {e.service for e in session.entries}
 
     try:
         with open(path, encoding='utf-8-sig') as f:  # utf-8-sig handles BOM
@@ -734,21 +1026,16 @@ def cmd_import(conn: sqlite3.Connection, key: bytes, csv_path: str):
                         skipped += 1
                         continue
 
-                    existing = get_entry_by_service(conn, title)
-                    if existing:
+                    title_key = title.lower().strip()
+                    if title_key in existing_services:
                         print(f"  {style(SYM_SKIP, C.DIM)} Row {row_num}: "
                               f"'{title}' {style('already exists', C.DIM)}")
                         skipped += 1
                         continue
 
-                    entry_salt = secrets.token_bytes(SALT_SIZE)
-                    entry_key = derive_key(
-                        base64.b64encode(key).decode(), entry_salt
-                    )
-                    nonce, encrypted = encrypt(password, entry_key)
-
-                    save_entry(conn, title, username, entry_salt, nonce,
-                               encrypted, url)
+                    save_entry(session.conn, session.key, title, username,
+                               password, url)
+                    existing_services.add(title_key)
                     print_success(f"{title} ({username})")
                     imported += 1
 
@@ -756,6 +1043,7 @@ def cmd_import(conn: sqlite3.Connection, key: bytes, csv_path: str):
                     print_error(f"Row {row_num}: {e}")
                     errors += 1
 
+        session.reload()
         print()
         print(f"  {style(_hr(), C.DIM)}")
         print_success(f"Imported: {imported}")
@@ -777,24 +1065,6 @@ def cmd_import(conn: sqlite3.Connection, key: bytes, csv_path: str):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Vault Session
-# ─────────────────────────────────────────────────────────────────────────────
-
-class VaultSession:
-    """Holds the active vault connection and derived key."""
-    def __init__(self, conn: sqlite3.Connection, key: bytes):
-        self.conn = conn
-        self.key = key
-        self.last_activity = time.time()
-
-    def touch(self):
-        self.last_activity = time.time()
-
-    def is_expired(self) -> bool:
-        return time.time() - self.last_activity > AUTO_LOCK_SECONDS
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Interactive REPL
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -811,7 +1081,9 @@ def print_repl_help():
     print(f"  {style('Commands', C.BOLD)}")
     print(f"  {style(_hr(), C.DIM)}")
     print(f"  {style('<service>', C.CYAN)}              "
-          f"Get password {style('(fuzzy match)', C.DIM)}")
+          f"Copy password {style('(fuzzy match)', C.DIM)}")
+    print(f"  {style('show', C.CYAN)} {style('<service>', C.DIM)}         "
+          f"Copy and display password")
     print(f"  {style('add', C.CYAN)}                    "
           f"Add new entry")
     print(f"  {style('list', C.CYAN)} / {style('ls', C.CYAN)}              "
@@ -838,7 +1110,9 @@ def print_oneshot_help():
     print(f"  sofiavault                        "
           f"{style('Interactive mode', C.DIM)}")
     print(f"  sofiavault {style('<service>', C.CYAN)}            "
-          f"{style('Get password (fuzzy match)', C.DIM)}")
+          f"{style('Copy password (fuzzy match)', C.DIM)}")
+    print(f"  sofiavault {style('show', C.CYAN)} {style('<service>', C.DIM)}       "
+          f"{style('Copy and display password', C.DIM)}")
     print(f"  sofiavault {style('add', C.CYAN)}                  "
           f"{style('Add new entry', C.DIM)}")
     print(f"  sofiavault {style('list', C.CYAN)}                 "
@@ -853,7 +1127,7 @@ def print_oneshot_help():
     print(f"  {style('Examples', C.BOLD)}")
     print(f"  {style(_hr(), C.DIM)}")
     print(f"  sofiavault amazon           "
-          f"{style('Get Amazon password', C.DIM)}")
+          f"{style('Copy Amazon password', C.DIM)}")
     fuzzy_desc = "Fuzzy matches 'amazon'"
     print(f"  sofiavault amazn            "
           f"{style(fuzzy_desc, C.DIM)}")
@@ -872,16 +1146,20 @@ class VaultREPL(cmd.Cmd):
         self.session = session
 
     def _check_lock(self) -> bool:
-        """Re-authenticate if session expired. Returns False if auth fails."""
-        if not self.session.is_expired():
+        """Re-authenticate if session expired. Returns False if auth fails.
+
+        On expiry the key and decrypted index are dropped from memory
+        immediately, before the user is prompted to re-authenticate.
+        """
+        if self.session.key is not None and not self.session.is_expired():
             return True
+        self.session.lock()
         print()
-        print_warn("Session timed out. Please re-authenticate.")
+        print_warn("Session locked. Please re-authenticate.")
         key = unlock_vault(self.session.conn)
         if key is None:
             return False
-        self.session.key = key
-        self.session.touch()
+        self.session.unlock_with(key)
         return True
 
     def precmd(self, line: str) -> str:
@@ -900,27 +1178,34 @@ class VaultREPL(cmd.Cmd):
 
     def do_add(self, _arg: str):
         """Add a new password entry"""
-        cmd_add(self.session.conn, self.session.key)
+        cmd_add(self.session)
 
     def do_list(self, _arg: str):
         """List all stored services"""
-        cmd_list(self.session.conn)
+        cmd_list(self.session)
 
     do_ls = do_list
 
     def do_get(self, arg: str):
-        """Get password for a service: get <service>"""
+        """Copy password for a service: get <service>"""
         if not arg.strip():
             print_info("Usage: get <service>  (or just type the service name)")
             return
-        cmd_get(self.session.conn, self.session.key, arg.strip())
+        cmd_get(self.session, arg.strip())
+
+    def do_show(self, arg: str):
+        """Copy and display password on screen: show <service>"""
+        if not arg.strip():
+            print_info("Usage: show <service>")
+            return
+        cmd_get(self.session, arg.strip(), show=True)
 
     def do_delete(self, arg: str):
         """Delete an entry: delete <service>"""
         if not arg.strip():
             print_info("Usage: delete <service>")
             return
-        cmd_delete(self.session.conn, arg.strip())
+        cmd_delete(self.session, arg.strip())
 
     do_del = do_delete
     do_rm = do_delete
@@ -930,7 +1215,7 @@ class VaultREPL(cmd.Cmd):
         if not arg.strip():
             print_info("Usage: import <path/to/file.csv>")
             return
-        cmd_import(self.session.conn, self.session.key, arg.strip())
+        cmd_import(self.session, arg.strip())
 
     def do_help(self, arg: str):
         """Show help"""
@@ -941,6 +1226,7 @@ class VaultREPL(cmd.Cmd):
 
     def do_exit(self, _arg: str):
         """Lock vault and exit"""
+        self.session.lock()
         print()
         print(f"  {style('Vault locked. Goodbye!', C.DIM)} ♥")
         print()
@@ -957,18 +1243,20 @@ class VaultREPL(cmd.Cmd):
         """Treat any unknown command as a service name lookup."""
         query = line.strip()
         if query:
-            cmd_get(self.session.conn, self.session.key, query)
+            cmd_get(self.session, query)
 
     # ── Tab Completion ────────────────────────────────────────────────────
 
     def _complete_service(self, text: str) -> list[str]:
-        services = get_all_services(self.session.conn)
-        names = [s[1] for s in services]
+        names = [e.service for e in self.session.entries]
         if text:
             return [n for n in names if n.startswith(text.lower())]
         return names
 
     def complete_get(self, text, _line, _begidx, _endidx):
+        return self._complete_service(text)
+
+    def complete_show(self, text, _line, _begidx, _endidx):
         return self._complete_service(text)
 
     def complete_delete(self, text, _line, _begidx, _endidx):
@@ -985,62 +1273,77 @@ class VaultREPL(cmd.Cmd):
 # Main Entry Point
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _run_oneshot(args: list[str]):
-    """Run a single command and exit (backward-compatible mode)."""
+def _open_vault(show_banner_on_setup: bool) -> tuple[sqlite3.Connection, bytes]:
+    """Init DB, unlock (or set up) the vault, and run any pending migration."""
     conn = init_db()
 
     if not is_vault_initialized(conn):
-        print_banner()
+        if show_banner_on_setup:
+            print_banner()
         key = setup_master(conn)
     else:
         key = unlock_vault(conn)
         if key is None:
             sys.exit(1)
 
+    migrate_legacy_vault(conn, key)
+    return conn, key
+
+
+def _warn_corrupt(session: VaultSession):
+    if session.corrupt_count:
+        print_warn(f"{session.corrupt_count} entries could not be decrypted.")
+
+
+def _run_oneshot(args: list[str]):
+    """Run a single command and exit (backward-compatible mode)."""
+    conn, key = _open_vault(show_banner_on_setup=True)
+    session = VaultSession(conn, key)
+    _warn_corrupt(session)
+
     command = args[0].lower()
 
     if command == 'add':
-        cmd_add(conn, key)
+        cmd_add(session)
     elif command in ('list', 'ls'):
-        cmd_list(conn)
+        cmd_list(session)
+    elif command == 'show':
+        if len(args) > 1:
+            cmd_get(session, args[1], show=True)
+        else:
+            print_info("Usage: sofiavault show <service>")
     elif command == 'import':
         if len(args) > 1:
-            cmd_import(conn, key, args[1])
+            cmd_import(session, args[1])
         else:
             print_info("Usage: sofiavault import <path/to/file.csv>")
     elif command in ('delete', 'del', 'rm'):
         if len(args) > 1:
-            cmd_delete(conn, args[1])
+            cmd_delete(session, args[1])
         else:
             print_info("Usage: sofiavault delete <service>")
     else:
         query = command.split(':', 1)[1] if ':' in command else command
-        cmd_get(conn, key, query)
+        cmd_get(session, query)
 
+    session.lock()
     conn.close()
 
 
 def _run_repl():
     """Launch the interactive REPL."""
     print_banner()
-    conn = init_db()
+    conn, key = _open_vault(show_banner_on_setup=False)
+    session = VaultSession(conn, key)
 
-    if not is_vault_initialized(conn):
-        key = setup_master(conn)
-    else:
-        key = unlock_vault(conn)
-        if key is None:
-            sys.exit(1)
-
-    entry_count = len(get_all_services(conn))
     print_success(f"Vault unlocked  "
-                  f"{style(f'({entry_count} entries)', C.DIM)}")
+                  f"{style(f'({len(session.entries)} entries)', C.DIM)}")
+    _warn_corrupt(session)
     print()
     print(f"  {style('Type a service name to search, or', C.DIM)} "
           f"{style('help', C.CYAN)} {style('for commands.', C.DIM)}")
     print()
 
-    session = VaultSession(conn, key)
     repl = VaultREPL(session)
 
     # Readline history
@@ -1062,8 +1365,10 @@ def _run_repl():
         try:
             if readline:
                 readline.write_history_file(str(HISTORY_PATH))
+                os.chmod(HISTORY_PATH, 0o600)
         except (OSError, NameError):
             pass
+        session.lock()
         conn.close()
 
 

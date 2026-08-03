@@ -10,20 +10,26 @@ A simple but secure password manager that runs entirely in your terminal. Works 
 
 - **Interactive mode** - Launch `sofiavault` and stay in the shell, like a real app
 - **Fuzzy matching** - Don't remember the exact name? Just type close enough
-- **Clipboard copy** - Passwords are automatically copied to your clipboard
+- **Clipboard copy with auto-clear** - Passwords are copied to your clipboard and
+  automatically cleared after 45 seconds
+- **Hidden by default** - Retrieved passwords are never printed unless you ask
+  with `show`
 - **Tab completion** - Press Tab to autocomplete service names
 - **CSV import** - Migrate from other password managers in seconds
-- **Auto-lock** - Session locks after 5 minutes of inactivity
+- **Auto-lock** - Session locks after 5 minutes of inactivity and wipes the key
+  and decrypted data from memory
 - **Cross-platform** - Works identically on macOS, Linux, and Windows
-- **Zero plaintext storage** - Passwords are never stored unencrypted
+- **Zero plaintext storage** - Passwords *and* metadata (service names,
+  usernames, URLs) are encrypted; the database contains only ciphertext
 
 ## Security
 
 | Component | Algorithm |
 |-----------|-----------|
-| Key Derivation | Argon2id (64 MB memory, 3 iterations, 4 parallelism) |
-| Encryption | AES-256-GCM authenticated encryption |
-| Salts | Unique 16-byte CSPRNG salt per entry |
+| Master Key Derivation | Argon2id (64 MB memory, 3 iterations, 4 parallelism) |
+| Per-Entry Keys | HKDF-SHA256 with a unique 16-byte CSPRNG salt per entry |
+| Encryption | AES-256-GCM authenticated encryption (metadata included in the ciphertext) |
+| File permissions | Vault directory 0700, database 0600 (POSIX) |
 
 See [SECURITY.md](SECURITY.md) for threat model and vulnerability reporting.
 
@@ -82,11 +88,13 @@ sv> gmail
   ┌────────────────────────────────────────────
   │ Service  gmail
   │ User     user@gmail.com
-  │ Pass     MySecurePass123
+  │ Pass     ••••••••••••
   │
-  │ Copied to clipboard
+  │ Copied to clipboard · clears in 45s
+  │ 'show gmail' to display it
   └────────────────────────────────────────────
 
+sv> show gmail
 sv> add
 sv> list
 sv> delete twitter
@@ -100,7 +108,8 @@ Tab-complete service names, use arrow keys for command history.
 Every command also works as a single CLI call:
 
 ```bash
-sofiavault amazon           # get password (fuzzy match)
+sofiavault amazon           # copy password to clipboard (fuzzy match)
+sofiavault show amazon      # copy and display the password
 sofiavault add              # add new entry
 sofiavault list             # list all services
 sofiavault delete amazon    # delete an entry
@@ -157,6 +166,9 @@ Your encrypted database is stored at:
 - **macOS/Linux**: `~/.sofiavault/vault.db`
 - **Windows**: `C:\Users\<you>\.sofiavault\vault.db`
 
+On POSIX systems the directory is created with mode 0700 and the database with
+0600, so no other local user can read them.
+
 ## How It Works
 
 ```
@@ -166,18 +178,27 @@ Master Password
    Argon2id (64MB memory, 3 iterations)
       |
       v
-   256-bit Key
+   256-bit Master Key
       |
       +---> Verification hash (stored)
       |
-      +---> Per-entry key derivation
+      +---> HKDF-SHA256 (unique salt per entry)
               |
               v
            AES-256-GCM
               |
               v
-           Encrypted password (stored)
+           One authenticated blob per entry (stored):
+           service + username + URL + password
 ```
+
+## Upgrading from 0.1.x
+
+Nothing to do — the first time you unlock an existing vault with 0.2.0, it is
+upgraded automatically. Your master password and all entries are preserved, and
+a backup of the original file is written to `~/.sofiavault/vault.db.v1-backup`
+before anything is changed. Once you've confirmed everything works, delete the
+backup (it still contains the old format's plaintext service names).
 
 ## Important Notes
 

@@ -29,7 +29,9 @@ mkdir -p "$BIN_DIR"
 chmod +x "$VAULT_PY"
 
 # Remove old wrapper/symlink if it exists
-[ -e "$WRAPPER" ] || [ -L "$WRAPPER" ] && rm -f "$WRAPPER"
+if [ -e "$WRAPPER" ] || [ -L "$WRAPPER" ]; then
+    rm -f "$WRAPPER"
+fi
 
 # Create symlink (not a wrapper file — avoids overwrite risks)
 ln -s "$VAULT_PY" "$WRAPPER"

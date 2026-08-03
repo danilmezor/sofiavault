@@ -1,48 +1,28 @@
 """Tests for SofiaVault interactive REPL."""
 
-import base64
 import secrets
 import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
 from sofiavault import (
-    SALT_SIZE,
+    KEY_SIZE,
     VaultREPL,
     VaultSession,
-    derive_key,
-    encrypt,
     init_db,
     save_entry,
-    save_master,
 )
 
 
 def _setup_session():
-    """Create a temp DB with a master password and some entries."""
+    """Create a temp DB with some entries and an unlocked session."""
     tmp = tempfile.mktemp(suffix=".db")
-    master_password = "testmaster123"
+    key = secrets.token_bytes(KEY_SIZE)
 
     with patch("sofiavault.DB_PATH", Path(tmp)):
         conn = init_db()
-
-        # Set up master password
-        salt = secrets.token_bytes(SALT_SIZE)
-        key = derive_key(master_password, salt)
-        verify_salt = secrets.token_bytes(SALT_SIZE)
-        verify_hash = derive_key(base64.b64encode(key).decode(), verify_salt)
-        save_master(conn, salt + verify_salt, verify_hash)
-
-        # Add some entries
-        entry_salt = secrets.token_bytes(SALT_SIZE)
-        entry_key = derive_key(base64.b64encode(key).decode(), entry_salt)
-        nonce, encrypted = encrypt("pass123", entry_key)
-        save_entry(conn, "Amazon", "user@test.com", entry_salt, nonce, encrypted)
-
-        entry_salt2 = secrets.token_bytes(SALT_SIZE)
-        entry_key2 = derive_key(base64.b64encode(key).decode(), entry_salt2)
-        nonce2, encrypted2 = encrypt("pass456", entry_key2)
-        save_entry(conn, "Google", "user2@test.com", entry_salt2, nonce2, encrypted2)
+        save_entry(conn, key, "Amazon", "user@test.com", "pass123")
+        save_entry(conn, key, "Google", "user2@test.com", "pass456")
 
     session = VaultSession(conn, key)
     return session, tmp
@@ -75,12 +55,14 @@ def test_repl_ls_alias(capsys):
     Path(tmp).unlink(missing_ok=True)
 
 
-def test_repl_exit_returns_true():
+def test_repl_exit_returns_true_and_locks():
     session, tmp = _setup_session()
     repl = VaultREPL(session)
 
     result = repl.onecmd("exit")
     assert result is True
+    assert session.key is None
+    assert session.entries == []
 
     session.conn.close()
     Path(tmp).unlink(missing_ok=True)
@@ -97,16 +79,48 @@ def test_repl_quit_returns_true():
     Path(tmp).unlink(missing_ok=True)
 
 
-def test_repl_default_fuzzy_get(capsys):
+def test_repl_default_get_hides_password_when_copied(capsys):
     session, tmp = _setup_session()
     repl = VaultREPL(session)
 
-    # Typing "amazon" directly should trigger fuzzy get via default()
-    repl.onecmd("amazon")
+    with patch("sofiavault.copy_to_clipboard", return_value=True), \
+         patch("sofiavault.schedule_clipboard_clear", return_value=True):
+        repl.onecmd("amazon")
 
     captured = capsys.readouterr()
     assert "user@test.com" in captured.out
+    assert "pass123" not in captured.out  # hidden by default
+    assert "clipboard" in captured.out.lower()
+
+    session.conn.close()
+    Path(tmp).unlink(missing_ok=True)
+
+
+def test_repl_show_displays_password(capsys):
+    session, tmp = _setup_session()
+    repl = VaultREPL(session)
+
+    with patch("sofiavault.copy_to_clipboard", return_value=True), \
+         patch("sofiavault.schedule_clipboard_clear", return_value=True):
+        repl.onecmd("show amazon")
+
+    captured = capsys.readouterr()
     assert "pass123" in captured.out
+
+    session.conn.close()
+    Path(tmp).unlink(missing_ok=True)
+
+
+def test_repl_get_falls_back_to_display_without_clipboard(capsys):
+    session, tmp = _setup_session()
+    repl = VaultREPL(session)
+
+    with patch("sofiavault.copy_to_clipboard", return_value=False):
+        repl.onecmd("amazon")
+
+    captured = capsys.readouterr()
+    assert "pass123" in captured.out
+    assert "clipboard unavailable" in captured.out.lower()
 
     session.conn.close()
     Path(tmp).unlink(missing_ok=True)
@@ -149,6 +163,7 @@ def test_repl_help_command(capsys):
     assert "Commands" in captured.out
     assert "add" in captured.out.lower()
     assert "list" in captured.out.lower()
+    assert "show" in captured.out.lower()
     assert "exit" in captured.out.lower()
 
     session.conn.close()
@@ -165,6 +180,37 @@ def test_vault_session_expiry():
     assert session.is_expired() is True
 
     session.touch()
+    assert session.is_expired() is False
+
+    session.conn.close()
+    Path(tmp).unlink(missing_ok=True)
+
+
+def test_expired_session_drops_key_from_memory(capsys):
+    session, tmp = _setup_session()
+    repl = VaultREPL(session)
+    session.last_activity = 0  # force expiry
+
+    # Failed re-auth: key and decrypted index must be gone
+    with patch("sofiavault.unlock_vault", return_value=None):
+        assert repl._check_lock() is False
+    assert session.key is None
+    assert session.entries == []
+
+    session.conn.close()
+    Path(tmp).unlink(missing_ok=True)
+
+
+def test_expired_session_restored_after_reauth(capsys):
+    session, tmp = _setup_session()
+    key = session.key
+    repl = VaultREPL(session)
+    session.last_activity = 0  # force expiry
+
+    with patch("sofiavault.unlock_vault", return_value=key):
+        assert repl._check_lock() is True
+    assert session.key == key
+    assert len(session.entries) == 2
     assert session.is_expired() is False
 
     session.conn.close()

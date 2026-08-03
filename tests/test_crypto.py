@@ -2,7 +2,17 @@
 
 import secrets
 
-from sofiavault import KEY_SIZE, SALT_SIZE, decrypt, derive_key, encrypt
+import pytest
+from cryptography.exceptions import InvalidTag
+
+from sofiavault import (
+    KEY_SIZE,
+    SALT_SIZE,
+    decrypt,
+    derive_entry_key,
+    derive_key,
+    encrypt,
+)
 
 
 def test_derive_key_produces_correct_length():
@@ -33,6 +43,22 @@ def test_derive_key_different_passwords_produce_different_keys():
     assert key1 != key2
 
 
+def test_derive_entry_key_length_and_deterministic():
+    master_key = secrets.token_bytes(KEY_SIZE)
+    salt = secrets.token_bytes(SALT_SIZE)
+    key1 = derive_entry_key(master_key, salt)
+    key2 = derive_entry_key(master_key, salt)
+    assert len(key1) == KEY_SIZE
+    assert key1 == key2
+
+
+def test_derive_entry_key_different_salts_differ():
+    master_key = secrets.token_bytes(KEY_SIZE)
+    key1 = derive_entry_key(master_key, secrets.token_bytes(SALT_SIZE))
+    key2 = derive_entry_key(master_key, secrets.token_bytes(SALT_SIZE))
+    assert key1 != key2
+
+
 def test_encrypt_decrypt_roundtrip():
     salt = secrets.token_bytes(SALT_SIZE)
     key = derive_key("masterpassword", salt)
@@ -42,6 +68,25 @@ def test_encrypt_decrypt_roundtrip():
     result = decrypt(nonce, ciphertext, key)
 
     assert result == plaintext
+
+
+def test_encrypt_decrypt_with_aad_roundtrip():
+    key = secrets.token_bytes(KEY_SIZE)
+    aad = b"sofiavault-entry-v2"
+
+    nonce, ciphertext = encrypt("secret", key, aad=aad)
+    assert decrypt(nonce, ciphertext, key, aad=aad) == "secret"
+
+
+def test_decrypt_wrong_aad_fails():
+    key = secrets.token_bytes(KEY_SIZE)
+
+    nonce, ciphertext = encrypt("secret", key, aad=b"context-a")
+
+    with pytest.raises(InvalidTag):
+        decrypt(nonce, ciphertext, key, aad=b"context-b")
+    with pytest.raises(InvalidTag):
+        decrypt(nonce, ciphertext, key)  # missing AAD must also fail
 
 
 def test_encrypt_decrypt_unicode():
@@ -76,7 +121,5 @@ def test_decrypt_wrong_key_fails():
 
     nonce, ciphertext = encrypt("secret", key1)
 
-    import pytest
-    from cryptography.exceptions import InvalidTag
     with pytest.raises(InvalidTag):
         decrypt(nonce, ciphertext, key2)

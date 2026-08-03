@@ -1,41 +1,61 @@
-"""Tests for SofiaVault database operations."""
+"""Tests for SofiaVault database operations (v2 encrypted-blob format)."""
 
 import secrets
+import stat
+import sys
 import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
 from sofiavault import (
-    SALT_SIZE,
+    KEY_SIZE,
     delete_entry,
-    get_all_services,
     get_entry_by_service,
     get_master_data,
+    get_password,
     init_db,
     is_vault_initialized,
+    load_entries,
     save_entry,
     save_master,
 )
 
 
 def _temp_db():
-    """Create an in-memory-like temp DB by patching DB_PATH."""
-    tmp = tempfile.mktemp(suffix=".db")
-    return tmp
+    """Create a temp DB path for patching DB_PATH."""
+    return tempfile.mktemp(suffix=".db")
+
+
+def _key():
+    return secrets.token_bytes(KEY_SIZE)
 
 
 def test_init_db_creates_tables():
     tmp = _temp_db()
     with patch("sofiavault.DB_PATH", Path(tmp)):
         conn = init_db()
-        # Check tables exist
         cur = conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
         )
         tables = [row[0] for row in cur.fetchall()]
-        assert "entries" in tables
+        assert "entries_v2" in tables
         assert "master" in tables
+        assert "vault_meta" in tables
+        # v2 format never creates the legacy plaintext-metadata table
+        assert "entries" not in tables
         conn.close()
+    Path(tmp).unlink(missing_ok=True)
+
+
+def test_db_file_permissions_restricted():
+    if sys.platform == "win32":
+        return  # POSIX permission bits are not meaningful on Windows
+    tmp = _temp_db()
+    with patch("sofiavault.DB_PATH", Path(tmp)):
+        conn = init_db()
+        conn.close()
+        mode = stat.S_IMODE(Path(tmp).stat().st_mode)
+        assert mode == 0o600
     Path(tmp).unlink(missing_ok=True)
 
 
@@ -67,65 +87,123 @@ def test_save_and_verify_master():
 
 def test_save_and_retrieve_entry():
     tmp = _temp_db()
+    key = _key()
     with patch("sofiavault.DB_PATH", Path(tmp)):
         conn = init_db()
-        salt = secrets.token_bytes(SALT_SIZE)
-        nonce = secrets.token_bytes(12)
-        encrypted = b"encrypted_data"
+        entry_id = save_entry(
+            conn, key, "Amazon", "user@test.com", "pass123", "https://amazon.com"
+        )
 
-        save_entry(conn, "Amazon", "user@test.com", salt, nonce, encrypted, "https://amazon.com")
+        entries, corrupt = load_entries(conn, key)
+        assert corrupt == 0
+        assert len(entries) == 1
+        entry = entries[0]
+        assert entry.service == "amazon"  # stored lowercase
+        assert entry.username == "user@test.com"
+        assert entry.url == "https://amazon.com"
 
-        entry = get_entry_by_service(conn, "amazon")
-        assert entry is not None
-        assert entry[1] == "amazon"  # stored lowercase
-        assert entry[2] == "user@test.com"
-        assert entry[3] == "https://amazon.com"
+        assert get_password(conn, key, entry_id) == "pass123"
         conn.close()
     Path(tmp).unlink(missing_ok=True)
 
 
-def test_get_all_services():
+def test_metadata_is_not_stored_in_plaintext():
     tmp = _temp_db()
+    key = _key()
     with patch("sofiavault.DB_PATH", Path(tmp)):
         conn = init_db()
-        salt = secrets.token_bytes(SALT_SIZE)
-        nonce = secrets.token_bytes(12)
+        save_entry(conn, key, "amazonsecret", "hidden@user.example",
+                   "topsecretpw", "https://hidden.example")
+        conn.close()
 
-        save_entry(conn, "Amazon", "u1", salt, nonce, b"enc1")
-        save_entry(conn, "Google", "u2", salt, nonce, b"enc2")
-        save_entry(conn, "Netflix", "u3", salt, nonce, b"enc3")
+    raw = Path(tmp).read_bytes()
+    assert b"amazonsecret" not in raw
+    assert b"hidden@user.example" not in raw
+    assert b"topsecretpw" not in raw
+    assert b"hidden.example" not in raw
+    Path(tmp).unlink(missing_ok=True)
 
-        services = get_all_services(conn)
-        assert len(services) == 3
-        names = [s[1] for s in services]
-        assert "amazon" in names
-        assert "google" in names
-        assert "netflix" in names
+
+def test_wrong_key_cannot_read_entries():
+    tmp = _temp_db()
+    key = _key()
+    with patch("sofiavault.DB_PATH", Path(tmp)):
+        conn = init_db()
+        entry_id = save_entry(conn, key, "Amazon", "user", "pass123")
+
+        entries, corrupt = load_entries(conn, _key())
+        assert entries == []
+        assert corrupt == 1
+        assert get_password(conn, _key(), entry_id) is None
+        conn.close()
+    Path(tmp).unlink(missing_ok=True)
+
+
+def test_tampered_entry_fails_decryption():
+    tmp = _temp_db()
+    key = _key()
+    with patch("sofiavault.DB_PATH", Path(tmp)):
+        conn = init_db()
+        entry_id = save_entry(conn, key, "Amazon", "user", "pass123")
+
+        row = conn.execute(
+            "SELECT blob FROM entries_v2 WHERE id = ?", (entry_id,)
+        ).fetchone()
+        tampered = bytearray(row[0])
+        tampered[0] ^= 0xFF
+        conn.execute(
+            "UPDATE entries_v2 SET blob = ? WHERE id = ?", (bytes(tampered), entry_id)
+        )
+        conn.commit()
+
+        entries, corrupt = load_entries(conn, key)
+        assert entries == []
+        assert corrupt == 1
+        assert get_password(conn, key, entry_id) is None
+        conn.close()
+    Path(tmp).unlink(missing_ok=True)
+
+
+def test_get_all_entries_sorted():
+    tmp = _temp_db()
+    key = _key()
+    with patch("sofiavault.DB_PATH", Path(tmp)):
+        conn = init_db()
+        save_entry(conn, key, "Netflix", "u3", "p3")
+        save_entry(conn, key, "Amazon", "u1", "p1")
+        save_entry(conn, key, "Google", "u2", "p2")
+
+        entries, _ = load_entries(conn, key)
+        names = [e.service for e in entries]
+        assert names == ["amazon", "google", "netflix"]
         conn.close()
     Path(tmp).unlink(missing_ok=True)
 
 
 def test_delete_entry():
     tmp = _temp_db()
+    key = _key()
     with patch("sofiavault.DB_PATH", Path(tmp)):
         conn = init_db()
-        salt = secrets.token_bytes(SALT_SIZE)
-        nonce = secrets.token_bytes(12)
+        save_entry(conn, key, "ToDelete", "user", "pass")
 
-        save_entry(conn, "ToDelete", "user", salt, nonce, b"enc")
-        entry = get_entry_by_service(conn, "todelete")
+        entries, _ = load_entries(conn, key)
+        entry = get_entry_by_service(entries, "todelete")
         assert entry is not None
 
-        delete_entry(conn, entry[0])
-        assert get_entry_by_service(conn, "todelete") is None
+        delete_entry(conn, entry.id)
+        entries, _ = load_entries(conn, key)
+        assert get_entry_by_service(entries, "todelete") is None
         conn.close()
     Path(tmp).unlink(missing_ok=True)
 
 
 def test_nonexistent_service_returns_none():
     tmp = _temp_db()
+    key = _key()
     with patch("sofiavault.DB_PATH", Path(tmp)):
         conn = init_db()
-        assert get_entry_by_service(conn, "nonexistent") is None
+        entries, _ = load_entries(conn, key)
+        assert get_entry_by_service(entries, "nonexistent") is None
         conn.close()
     Path(tmp).unlink(missing_ok=True)

@@ -6,18 +6,19 @@ from pathlib import Path
 from unittest.mock import patch
 
 from sofiavault import (
-    SALT_SIZE,
+    KEY_SIZE,
+    VaultSession,
     cmd_import,
-    derive_key,
-    get_all_services,
     get_entry_by_service,
+    get_password,
     init_db,
 )
 
 
-def _make_key():
-    salt = secrets.token_bytes(SALT_SIZE)
-    return derive_key("testmaster", salt)
+def _make_session(db_tmp: str) -> VaultSession:
+    with patch("sofiavault.DB_PATH", Path(db_tmp)):
+        conn = init_db()
+    return VaultSession(conn, secrets.token_bytes(KEY_SIZE))
 
 
 def _make_csv(content: str) -> str:
@@ -33,15 +34,17 @@ def test_import_basic_csv(capsys):
         "Amazon,user@test.com,pass123,https://amazon.com\n"
         "Google,user2@test.com,pass456,https://google.com\n"
     )
-    key = _make_key()
+    session = _make_session(db_tmp)
 
-    with patch("sofiavault.DB_PATH", Path(db_tmp)):
-        conn = init_db()
-        cmd_import(conn, key, csv_tmp)
+    cmd_import(session, csv_tmp)
 
-        services = get_all_services(conn)
-        assert len(services) == 2
-        conn.close()
+    assert len(session.entries) == 2
+    amazon = get_entry_by_service(session.entries, "amazon")
+    assert amazon is not None
+    assert amazon.username == "user@test.com"
+    assert amazon.url == "https://amazon.com"
+    assert get_password(session.conn, session.key, amazon.id) == "pass123"
+    session.conn.close()
 
     Path(db_tmp).unlink(missing_ok=True)
     Path(csv_tmp).unlink(missing_ok=True)
@@ -53,18 +56,34 @@ def test_import_skips_duplicates(capsys):
         "TITLE,USERNAME,PASSWORD\n"
         "Amazon,user@test.com,pass123\n"
     )
-    key = _make_key()
+    session = _make_session(db_tmp)
 
-    with patch("sofiavault.DB_PATH", Path(db_tmp)):
-        conn = init_db()
-        # Import once
-        cmd_import(conn, key, csv_tmp)
-        assert len(get_all_services(conn)) == 1
+    cmd_import(session, csv_tmp)
+    assert len(session.entries) == 1
 
-        # Import again - should skip duplicate
-        cmd_import(conn, key, csv_tmp)
-        assert len(get_all_services(conn)) == 1
-        conn.close()
+    # Import again - should skip duplicate
+    cmd_import(session, csv_tmp)
+    assert len(session.entries) == 1
+    session.conn.close()
+
+    Path(db_tmp).unlink(missing_ok=True)
+    Path(csv_tmp).unlink(missing_ok=True)
+
+
+def test_import_skips_duplicates_within_same_file(capsys):
+    db_tmp = tempfile.mktemp(suffix=".db")
+    csv_tmp = _make_csv(
+        "TITLE,USERNAME,PASSWORD\n"
+        "Amazon,first@test.com,pass123\n"
+        "Amazon,second@test.com,pass456\n"
+    )
+    session = _make_session(db_tmp)
+
+    cmd_import(session, csv_tmp)
+
+    assert len(session.entries) == 1
+    assert session.entries[0].username == "first@test.com"
+    session.conn.close()
 
     Path(db_tmp).unlink(missing_ok=True)
     Path(csv_tmp).unlink(missing_ok=True)
@@ -73,16 +92,13 @@ def test_import_skips_duplicates(capsys):
 def test_import_missing_columns(capsys):
     db_tmp = tempfile.mktemp(suffix=".db")
     csv_tmp = _make_csv("NAME,PASS\nAmazon,pass123\n")
-    key = _make_key()
+    session = _make_session(db_tmp)
 
-    with patch("sofiavault.DB_PATH", Path(db_tmp)):
-        conn = init_db()
-        cmd_import(conn, key, csv_tmp)
+    cmd_import(session, csv_tmp)
 
-        # Should import nothing due to missing required columns
-        services = get_all_services(conn)
-        assert len(services) == 0
-        conn.close()
+    # Should import nothing due to missing required columns
+    assert len(session.entries) == 0
+    session.conn.close()
 
     Path(db_tmp).unlink(missing_ok=True)
     Path(csv_tmp).unlink(missing_ok=True)
@@ -96,15 +112,12 @@ def test_import_skips_empty_fields(capsys):
         "Google,,pass456\n"
         "Netflix,user3,\n"
     )
-    key = _make_key()
+    session = _make_session(db_tmp)
 
-    with patch("sofiavault.DB_PATH", Path(db_tmp)):
-        conn = init_db()
-        cmd_import(conn, key, csv_tmp)
+    cmd_import(session, csv_tmp)
 
-        services = get_all_services(conn)
-        assert len(services) == 0  # All rows should be skipped
-        conn.close()
+    assert len(session.entries) == 0  # All rows should be skipped
+    session.conn.close()
 
     Path(db_tmp).unlink(missing_ok=True)
     Path(csv_tmp).unlink(missing_ok=True)
@@ -112,14 +125,12 @@ def test_import_skips_empty_fields(capsys):
 
 def test_import_nonexistent_file(capsys):
     db_tmp = tempfile.mktemp(suffix=".db")
-    key = _make_key()
+    session = _make_session(db_tmp)
 
-    with patch("sofiavault.DB_PATH", Path(db_tmp)):
-        conn = init_db()
-        cmd_import(conn, key, "/nonexistent/path/file.csv")
-        captured = capsys.readouterr()
-        assert "not found" in captured.out.lower()
-        conn.close()
+    cmd_import(session, "/nonexistent/path/file.csv")
+    captured = capsys.readouterr()
+    assert "not found" in captured.out.lower()
+    session.conn.close()
 
     Path(db_tmp).unlink(missing_ok=True)
 
@@ -130,16 +141,14 @@ def test_import_without_url_column(capsys):
         "TITLE,USERNAME,PASSWORD\n"
         "Amazon,user@test.com,pass123\n"
     )
-    key = _make_key()
+    session = _make_session(db_tmp)
 
-    with patch("sofiavault.DB_PATH", Path(db_tmp)):
-        conn = init_db()
-        cmd_import(conn, key, csv_tmp)
+    cmd_import(session, csv_tmp)
 
-        entry = get_entry_by_service(conn, "amazon")
-        assert entry is not None
-        assert entry[3] == ""  # URL should be empty string
-        conn.close()
+    entry = get_entry_by_service(session.entries, "amazon")
+    assert entry is not None
+    assert entry.url == ""  # URL should be empty string
+    session.conn.close()
 
     Path(db_tmp).unlink(missing_ok=True)
     Path(csv_tmp).unlink(missing_ok=True)
