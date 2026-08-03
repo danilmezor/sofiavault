@@ -21,6 +21,8 @@ A simple but secure password manager that runs entirely in your terminal. Works 
 - **Cross-platform** - Works identically on macOS, Linux, and Windows
 - **Zero plaintext storage** - Passwords *and* metadata (service names,
   usernames, URLs) are encrypted; the database contains only ciphertext
+- **Update check** - After unlocking, SofiaVault tells you when security
+  updates are available and can install them with one keystroke
 
 ## Security
 
@@ -191,6 +193,19 @@ Master Password
            One authenticated blob per entry (stored):
            service + username + URL + password
 ```
+
+## Staying Up to Date
+
+If you installed from a git clone (the `setup.sh` / `install.py` path), every
+unlock quickly checks whether `origin/main` has new commits. If it does, you'll
+see what changed and be offered a one-keystroke update — for a password
+manager, staying current matters, since updates often carry security fixes.
+
+- Offline or no remote? The check is skipped silently (capped at 5 seconds).
+- Local changes or a different branch checked out? It never auto-pulls; you
+  get the manual command instead.
+- Prefer no network activity on unlock? Set `SOFIAVAULT_SKIP_UPDATE_CHECK=1`
+  (the check contacts your git remote, e.g. GitHub, each time you unlock).
 
 ## Upgrading from 0.1.x
 

@@ -40,6 +40,8 @@ except ImportError:
 # Configuration
 # ─────────────────────────────────────────────────────────────────────────────
 
+__version__ = "0.2.1"
+
 DB_PATH = Path.home() / ".sofiavault" / "vault.db"
 HISTORY_PATH = Path.home() / ".sofiavault" / ".history"
 ARGON2_TIME_COST = 3
@@ -50,6 +52,8 @@ NONCE_SIZE = 12
 KEY_SIZE = 32  # 256 bits for AES-256
 AUTO_LOCK_SECONDS = 300  # 5 minutes
 CLIPBOARD_CLEAR_SECONDS = 45
+UPDATE_FETCH_TIMEOUT = 5   # seconds; keeps unlock fast when offline
+UPDATE_PULL_TIMEOUT = 60
 
 # Domain-separation constant: HKDF info and GCM associated data for v2 entries
 ENTRY_CONTEXT = b"sofiavault-entry-v2"
@@ -244,6 +248,133 @@ def schedule_clipboard_clear(secret: str, delay: int = CLIPBOARD_CLEAR_SECONDS) 
         return True
     except Exception:
         return False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Update Check
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _repo_dir() -> Optional[Path]:
+    """Return the git clone this script runs from, or None (pip installs etc.)."""
+    try:
+        here = Path(__file__).resolve().parent
+    except OSError:
+        return None
+    if (here / '.git').exists():
+        return here
+    return None
+
+
+def _git(repo: Path, *args: str, timeout: int = UPDATE_FETCH_TIMEOUT):
+    """Run a git command in the repo. Returns None on timeout/missing git."""
+    try:
+        return subprocess.run(
+            ['git', '-C', str(repo), *args],
+            capture_output=True, text=True, timeout=timeout
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+
+
+def _stdin_is_interactive() -> bool:
+    return sys.stdin is not None and sys.stdin.isatty()
+
+
+def check_for_updates():
+    """Offer to update when this install is behind origin/main.
+
+    Runs right after the vault is unlocked. Stays silent and fast when
+    offline, when not installed from a git clone, or when disabled with
+    SOFIAVAULT_SKIP_UPDATE_CHECK=1. Never auto-pulls over local changes
+    or a non-main checkout — those get manual instructions instead.
+    """
+    if os.environ.get('SOFIAVAULT_SKIP_UPDATE_CHECK'):
+        return
+    repo = _repo_dir()
+    if repo is None:
+        return
+
+    fetch = _git(repo, 'fetch', '--quiet', 'origin', 'main')
+    if fetch is None or fetch.returncode != 0:
+        return  # offline, no remote, or no git — skip silently
+
+    count = _git(repo, 'rev-list', '--count', 'HEAD..origin/main')
+    if count is None or count.returncode != 0:
+        return
+    try:
+        behind = int(count.stdout.strip() or 0)
+    except ValueError:
+        return
+    if behind == 0:
+        return
+
+    log = _git(repo, 'log', '--pretty=%s', '-8', 'HEAD..origin/main')
+    subjects = log.stdout.splitlines() if log is not None and log.returncode == 0 else []
+
+    plural = 's' if behind != 1 else ''
+    print()
+    print(f"  {style(_hr(), C.YELLOW)}")
+    print(f"  {style('!  SECURITY UPDATE AVAILABLE', C.BOLD, C.BYELLOW)}  "
+          f"{style(f'({behind} new commit{plural} on main)', C.DIM)}")
+    print(f"  {style(_hr(), C.YELLOW)}")
+    print(f"  {style('Your password manager is out of date.', C.BOLD)}")
+    print("  Updates often contain security fixes — staying on an old")
+    print("  version may leave known vulnerabilities unpatched and put")
+    print("  your stored credentials at risk.")
+    if subjects:
+        print()
+        print(f"  {style('What changed:', C.DIM)}")
+        for subject in subjects:
+            print(f"    {style(SYM_BULLET, C.CYAN)} {subject}")
+        if behind > len(subjects):
+            print(f"    {style(f'... and {behind - len(subjects)} more', C.DIM)}")
+    print()
+
+    manual_cmd = f"git -C {repo} pull --ff-only origin main"
+
+    if not _stdin_is_interactive():
+        print_warn("Non-interactive session — continuing with the outdated version.")
+        print_info(f"Update with: {manual_cmd}")
+        print()
+        return
+
+    branch = _git(repo, 'rev-parse', '--abbrev-ref', 'HEAD')
+    on_main = branch is not None and branch.returncode == 0 and branch.stdout.strip() == 'main'
+    status = _git(repo, 'status', '--porcelain', '--untracked-files=no')
+    dirty = status is None or status.returncode != 0 or bool(status.stdout.strip())
+
+    if not on_main or dirty:
+        reason = "local changes present" if dirty else "not on the main branch"
+        print_warn(f"Can't update automatically ({reason}).")
+        print_info(f"Update manually: {manual_cmd}")
+        print()
+        return
+
+    try:
+        answer = input(
+            f"  {style('Update now?', C.BOLD)} {style('[Y/n]', C.DIM)}: "
+        ).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        answer = 'n'
+
+    if answer in ('', 'y', 'yes'):
+        pull = _git(repo, 'pull', '--ff-only', 'origin', 'main',
+                    timeout=UPDATE_PULL_TIMEOUT)
+        if pull is not None and pull.returncode == 0:
+            print()
+            print_success("Updated to the latest version.")
+            print_info("Please restart SofiaVault to finish the update.")
+            print()
+            sys.exit(0)
+        print_error("Update failed.")
+        detail = ((pull.stderr or pull.stdout).strip().splitlines() if pull else [])
+        if detail:
+            print_info(detail[0])
+        print_info(f"Update manually: {manual_cmd}")
+    else:
+        print_warn("Skipping update — you remain on an outdated, "
+                   "potentially vulnerable version.")
+    print()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1286,6 +1417,9 @@ def _open_vault(show_banner_on_setup: bool) -> tuple[sqlite3.Connection, bytes]:
         if key is None:
             sys.exit(1)
 
+    # Update check runs before migration on purpose: if the user updates
+    # and restarts, the new version handles any pending migration itself.
+    check_for_updates()
     migrate_legacy_vault(conn, key)
     return conn, key
 
@@ -1382,6 +1516,10 @@ def main():
     if args[0] in ('help', '-h', '--help'):
         print_banner()
         print_oneshot_help()
+        return
+
+    if args[0] in ('version', '--version', '-V'):
+        print(f"SofiaVault {__version__}")
         return
 
     _run_oneshot(args)

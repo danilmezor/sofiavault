@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sofiavault"
-version = "0.2.0"
+version = "0.2.1"
 description = "A secure terminal password manager with fuzzy matching"
 readme = "README.md"
 license = "MIT"

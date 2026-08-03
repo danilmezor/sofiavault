@@ -2,6 +2,24 @@
 
 All notable changes to SofiaVault will be documented in this file.
 
+## [0.2.1] - 2026-08-02
+
+### Added
+- **Update check on unlock**: when installed from a git clone and the machine
+  is online, SofiaVault checks `origin/main` right after the master password
+  is entered. If the install is behind, it shows what changed, explains why
+  staying current matters for a password manager, and offers a one-keystroke
+  update (`git pull --ff-only`), then asks you to restart.
+  - Silent and fast when offline, when there is no remote, or for non-git
+    installs; the fetch is capped at 5 seconds so unlock is never held up.
+  - Never auto-pulls over local changes or a non-`main` checkout — prints
+    manual instructions instead.
+  - Runs before vault migration, so after an update the new version handles
+    any pending storage upgrades.
+  - Opt out with `SOFIAVAULT_SKIP_UPDATE_CHECK=1` (note: the check contacts
+    your git remote, e.g. GitHub, each time you unlock).
+- `sofiavault --version` / `version` command.
+
 ## [0.2.0] - 2026-08-02
 
 Security-focused release. Existing vaults are upgraded automatically and
