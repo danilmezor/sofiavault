@@ -14,6 +14,9 @@ A simple but secure password manager that runs entirely in your terminal. Works 
   automatically cleared after 45 seconds
 - **Hidden by default** - Retrieved passwords are never printed unless you ask
   with `show`
+- **Edit & generate** - Rotate a password in seconds with `edit`; `gen` makes
+  strong random passwords (optionally mixing in your own keyboard-mash entropy
+  on top of the OS CSPRNG)
 - **Tab completion** - Press Tab to autocomplete service names
 - **CSV import** - Migrate from other password managers in seconds
 - **Auto-lock** - Session locks after 5 minutes of inactivity and wipes the key
@@ -113,6 +116,8 @@ Every command also works as a single CLI call:
 sofiavault amazon           # copy password to clipboard (fuzzy match)
 sofiavault show amazon      # copy and display the password
 sofiavault add              # add new entry
+sofiavault edit amazon      # edit an entry (Enter keeps current values)
+sofiavault gen              # generate a strong password (gen 32, gen --mix)
 sofiavault list             # list all services
 sofiavault delete amazon    # delete an entry
 sofiavault import file.csv  # import from CSV

@@ -11,12 +11,15 @@ import cmd
 import contextlib
 import csv
 import getpass
+import hashlib
 import hmac
 import json
+import math
 import os
 import secrets
 import shutil
 import sqlite3
+import string
 import subprocess
 import sys
 import time
@@ -40,7 +43,7 @@ except ImportError:
 # Configuration
 # ─────────────────────────────────────────────────────────────────────────────
 
-__version__ = "0.2.2"
+__version__ = "0.2.3"
 
 DB_PATH = Path.home() / ".sofiavault" / "vault.db"
 HISTORY_PATH = Path.home() / ".sofiavault" / ".history"
@@ -54,6 +57,9 @@ AUTO_LOCK_SECONDS = 300  # 5 minutes
 CLIPBOARD_CLEAR_SECONDS = 45
 UPDATE_FETCH_TIMEOUT = 5   # seconds; keeps unlock fast when offline
 UPDATE_PULL_TIMEOUT = 60
+GEN_DEFAULT_LENGTH = 20
+GEN_CHARSET = string.ascii_letters + string.digits + "!@#$%^&*-_=+?"
+GEN_TARGET_USER_BITS = 128  # claimed user entropy target for --mix
 
 # Domain-separation constant: HKDF info and GCM associated data for v2 entries
 ENTRY_CONTEXT = b"sofiavault-entry-v2"
@@ -248,6 +254,148 @@ def schedule_clipboard_clear(secret: str, delay: int = CLIPBOARD_CLEAR_SECONDS) 
         return True
     except Exception:
         return False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Password Generation
+# ─────────────────────────────────────────────────────────────────────────────
+
+def generate_password(length: int = GEN_DEFAULT_LENGTH) -> str:
+    """Generate a password from the OS CSPRNG (secrets)."""
+    return ''.join(secrets.choice(GEN_CHARSET) for _ in range(length))
+
+
+def _password_from_pool(pool: bytes, length: int) -> str:
+    """Derive a password from an entropy pool via rejection sampling.
+
+    Expands the pool with SHA-512 counters and rejects bytes >= the largest
+    multiple of the charset size, so every symbol is exactly equally likely
+    (no modulo bias).
+    """
+    limit = 256 - (256 % len(GEN_CHARSET))
+    out: list[str] = []
+    counter = 0
+    while len(out) < length:
+        block = hashlib.sha512(pool + counter.to_bytes(4, 'big')).digest()
+        counter += 1
+        for b in block:
+            if len(out) == length:
+                break
+            if b < limit:
+                out.append(GEN_CHARSET[b % len(GEN_CHARSET)])
+    return ''.join(out)
+
+
+def _collect_user_entropy(target_bits: int = GEN_TARGET_USER_BITS) -> bytes:
+    """Collect keyboard-mash entropy: key bytes + nanosecond timings.
+
+    Credited conservatively at ~2 bits per keystroke (1 for the character,
+    1 for the inter-keystroke timing). The result is only ever MIXED with
+    the OS CSPRNG, never used alone, so a weak mash cannot hurt.
+    """
+    needed = max(1, target_bits // 2)
+    collected = bytearray()
+    count = 0
+
+    print()
+    print_info("Mash random keys — content and timing both feed the pool.")
+    print_info("Press Enter to finish early.")
+    print()
+
+    def note(ch: bytes):
+        nonlocal count
+        collected.extend(ch)
+        collected.extend(time.perf_counter_ns().to_bytes(8, 'big'))
+        count += 1
+        if sys.stdout.isatty():
+            pct = min(100, int(100 * count / needed))
+            filled = pct * 24 // 100
+            bar = "#" * filled + "-" * (24 - filled)
+            sys.stdout.write(f"\r  [{bar}] {pct}%")
+            sys.stdout.flush()
+
+    try:
+        if sys.platform == 'win32':
+            import msvcrt
+            while count < needed:
+                ch = msvcrt.getch()
+                if ch in (b'\r', b'\n'):
+                    break
+                note(ch)
+        elif sys.stdin.isatty():
+            import termios
+            import tty
+            fd = sys.stdin.fileno()
+            old = termios.tcgetattr(fd)
+            try:
+                tty.setcbreak(fd)
+                while count < needed:
+                    ch = os.read(fd, 1)
+                    if ch in (b'\r', b'\n'):
+                        break
+                    note(ch)
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        else:
+            raise OSError("no tty")
+    except (ImportError, OSError):
+        # Non-interactive fallback: a typed line still contributes content
+        typed = getpass.getpass(style("  Type a long random string: ", C.DIM))
+        collected.extend(typed.encode('utf-8'))
+        collected.extend(time.perf_counter_ns().to_bytes(8, 'big'))
+        count = len(typed)
+
+    if sys.stdout.isatty():
+        print()
+    if count < needed:
+        print_warn(f"Stopped early — ~{count * 2} bits of claimed user entropy "
+                   "(still mixed with the OS CSPRNG, so this is safe).")
+    return bytes(collected)
+
+
+def _print_generated(password: str, mixed: bool = False):
+    """Show a generated password and copy it to the clipboard."""
+    bits = int(len(password) * math.log2(len(GEN_CHARSET)))
+    copied = copy_to_clipboard(password)
+    clearing = copied and schedule_clipboard_clear(password)
+
+    print()
+    print(f"  {style(SYM_BOX_TOP + SYM_BOX_H * 44, C.DIM)}")
+    print(f"  {style(SYM_BOX_SIDE, C.DIM)} {style('Password', C.DIM)} "
+          f"{style(password, C.BOLD, C.GREEN)}")
+    source = "OS CSPRNG + user entropy" if mixed else "OS CSPRNG"
+    print(f"  {style(SYM_BOX_SIDE, C.DIM)} {style(f'~{bits} bits {SYM_DOT} {source}', C.DIM)}")
+    if copied:
+        note = "Copied to clipboard"
+        if clearing:
+            note += f" {SYM_DOT} clears in {CLIPBOARD_CLEAR_SECONDS}s"
+        print(f"  {style(SYM_BOX_SIDE, C.DIM)} {style(note, C.DIM, C.GREEN)}")
+    print(f"  {style(SYM_BOX_BOT + SYM_BOX_H * 44, C.DIM)}")
+    print()
+
+
+def cmd_gen(arg: str = ''):
+    """Generate a strong password: gen [length] [--mix]"""
+    length = GEN_DEFAULT_LENGTH
+    mix = False
+    for token in arg.split():
+        if token in ('--mix', 'mix'):
+            mix = True
+        elif token.isdigit():
+            length = int(token)
+        else:
+            print_info("Usage: gen [length] [--mix]")
+            return
+    length = max(8, min(128, length))
+
+    if mix:
+        user_entropy = _collect_user_entropy()
+        pool = hashlib.sha512(secrets.token_bytes(64) + user_entropy).digest()
+        password = _password_from_pool(pool, length)
+    else:
+        password = generate_password(length)
+
+    _print_generated(password, mixed=mix)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -516,16 +664,49 @@ def load_entries(conn: sqlite3.Connection, key: bytes) -> tuple[list[VaultEntry]
     return entries, corrupt
 
 
-def get_password(conn: sqlite3.Connection, key: bytes, entry_id: int) -> Optional[str]:
-    """Decrypt and return the password for one entry, or None on failure."""
+def _load_entry_payload(conn: sqlite3.Connection, key: bytes,
+                        entry_id: int) -> Optional[dict]:
+    """Decrypt one entry's full payload dict, or None on failure."""
     cur = conn.execute("SELECT salt, nonce, blob FROM entries_v2 WHERE id = ?", (entry_id,))
     row = cur.fetchone()
     if row is None:
         return None
     try:
-        return _decrypt_entry_row(key, row[0], row[1], row[2])['password']
+        return _decrypt_entry_row(key, row[0], row[1], row[2])
     except Exception:
         return None
+
+
+def get_password(conn: sqlite3.Connection, key: bytes, entry_id: int) -> Optional[str]:
+    """Decrypt and return the password for one entry, or None on failure."""
+    data = _load_entry_payload(conn, key, entry_id)
+    if data is None:
+        return None
+    return data.get('password')
+
+
+def update_entry(conn: sqlite3.Connection, key: bytes, entry_id: int,
+                 service: str, username: str, url: str, password: str,
+                 created_at: str):
+    """Re-encrypt an entry in place with a fresh salt and nonce."""
+    payload = json.dumps({
+        'service': service.lower().strip(),
+        'username': username,
+        'url': url,
+        'password': password,
+        'created_at': created_at,
+        'updated_at': time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime()),
+    }, ensure_ascii=False)
+
+    entry_salt = secrets.token_bytes(SALT_SIZE)
+    entry_key = derive_entry_key(key, entry_salt)
+    nonce, blob = encrypt(payload, entry_key, aad=ENTRY_CONTEXT)
+
+    conn.execute(
+        "UPDATE entries_v2 SET salt = ?, nonce = ?, blob = ? WHERE id = ?",
+        (entry_salt, nonce, blob, entry_id)
+    )
+    conn.commit()
 
 
 def get_entry_by_service(entries: list[VaultEntry], service: str) -> Optional[VaultEntry]:
@@ -1201,6 +1382,110 @@ def cmd_get(session: VaultSession, query: str, show: bool = False):
         print_error("Invalid selection.")
 
 
+def _select_entry(session: VaultSession, query: str) -> Optional[VaultEntry]:
+    """Resolve a query to one entry: exact match, then fuzzy with a menu."""
+    exact = get_entry_by_service(session.entries, query)
+    if exact:
+        return exact
+
+    matches = fuzzy_find_service(session.entries, query, threshold=70)
+    if not matches:
+        print()
+        print_error(f"No matches found for '{query}'")
+        print()
+        return None
+    if len(matches) == 1:
+        return matches[0][0]
+
+    print()
+    print(f"  {style('Multiple matches for', C.DIM)} '{style(query, C.CYAN)}':")
+    print()
+    for i, (entry, _score) in enumerate(matches, 1):
+        print(f"  {style(f'[{i}]', C.BOLD)} {entry.service} "
+              f"{style(f'({entry.username})', C.DIM)}")
+    print(f"  {style('[0]', C.DIM)} Cancel")
+    print()
+    try:
+        choice = input(f"  {style('Select:', C.DIM)} ").strip()
+        if not choice or choice == '0':
+            return None
+        idx = int(choice) - 1
+        if 0 <= idx < len(matches):
+            return matches[idx][0]
+    except (ValueError, IndexError):
+        pass
+    print_error("Invalid selection.")
+    return None
+
+
+def cmd_edit(session: VaultSession, query: str):
+    """Edit an existing entry; Enter keeps each current value."""
+    entry = _select_entry(session, query)
+    if entry is None:
+        return
+
+    data = _load_entry_payload(session.conn, session.key, entry.id)
+    if data is None:
+        print_error(f"Decryption failed for '{entry.service}'. "
+                    "The entry may be corrupted or tampered with.")
+        return
+
+    print()
+    print(f"  {style(_hr(), C.DIM)}")
+    print(f"  {style('Edit Entry', C.BOLD)}  {style(entry.service, C.CYAN)}")
+    print(f"  {style(_hr(), C.DIM)}")
+    print(f"  {style('Enter keeps the current value.', C.DIM)}")
+    print()
+
+    new_service = input(
+        f"  {style('Service ', C.DIM)} [{entry.service}]: "
+    ).strip().lower() or entry.service
+    if new_service != entry.service and any(
+        e.service == new_service and e.id != entry.id for e in session.entries
+    ):
+        print_error(f"'{new_service}' already exists. Nothing was changed.")
+        print()
+        return
+
+    cur_username = data.get('username', '')
+    new_username = input(
+        f"  {style('Username', C.DIM)} [{cur_username}]: "
+    ).strip() or cur_username
+
+    cur_url = data.get('url', '')
+    clear_hint = style("('-' clears)", C.DIM)
+    url_raw = input(
+        f"  {style('URL     ', C.DIM)} [{cur_url or 'none'}] {clear_hint}: "
+    ).strip()
+    new_url = '' if url_raw == '-' else (url_raw or cur_url)
+
+    cur_password = data.get('password', '')
+    gen_answer = input(
+        f"  {style('Generate a strong password?', C.DIM)} {style('[y/N]', C.DIM)}: "
+    ).strip().lower()
+    if gen_answer in ('y', 'yes'):
+        new_password = generate_password()
+        _print_generated(new_password)
+    else:
+        typed = getpass.getpass(
+            f"  {style('Password', C.DIM)} (hidden, Enter to keep): "
+        )
+        new_password = typed if typed else cur_password
+
+    if (new_service == entry.service and new_username == cur_username
+            and new_url == cur_url and new_password == cur_password):
+        print_info("No changes.")
+        print()
+        return
+
+    update_entry(session.conn, session.key, entry.id, new_service, new_username,
+                 new_url, new_password, data.get('created_at', ''))
+    session.reload()
+    print()
+    print_success(f"Updated {style(new_service, C.CYAN)}")
+    print()
+
+
 def cmd_list(session: VaultSession):
     """List all stored services"""
     entries = session.entries
@@ -1432,6 +1717,10 @@ def print_repl_help():
           f"Copy and display password")
     print(f"  {style('add', C.CYAN)}                    "
           f"Add new entry")
+    print(f"  {style('edit', C.CYAN)} {style('<service>', C.DIM)}         "
+          f"Edit an entry (Enter keeps values)")
+    print(f"  {style('gen', C.CYAN)} {style('[len] [--mix]', C.DIM)}      "
+          f"Generate a strong password")
     print(f"  {style('list', C.CYAN)} / {style('ls', C.CYAN)}              "
           f"List all services")
     print(f"  {style('delete', C.CYAN)} / {style('rm', C.CYAN)} "
@@ -1465,6 +1754,10 @@ def print_oneshot_help():
           f"{style('Copy and display password', C.DIM)}")
     print(f"  sofiavault {style('add', C.CYAN)}                  "
           f"{style('Add new entry', C.DIM)}")
+    print(f"  sofiavault {style('edit', C.CYAN)} {style('<service>', C.DIM)}       "
+          f"{style('Edit an entry', C.DIM)}")
+    print(f"  sofiavault {style('gen', C.CYAN)} {style('[len] [--mix]', C.DIM)}    "
+          f"{style('Generate a strong password', C.DIM)}")
     print(f"  sofiavault {style('list', C.CYAN)}                 "
           f"{style('List all services', C.DIM)}")
     print(f"  sofiavault {style('delete', C.CYAN)} {style('<service>', C.DIM)}     "
@@ -1554,6 +1847,17 @@ class VaultREPL(cmd.Cmd):
             return
         cmd_get(self.session, arg.strip(), show=True)
 
+    def do_edit(self, arg: str):
+        """Edit an entry (Enter keeps current values): edit <service>"""
+        if not arg.strip():
+            print_info("Usage: edit <service>")
+            return
+        cmd_edit(self.session, arg.strip())
+
+    def do_gen(self, arg: str):
+        """Generate a strong password: gen [length] [--mix]"""
+        cmd_gen(arg.strip())
+
     def do_delete(self, arg: str):
         """Delete an entry: delete <service>"""
         if not arg.strip():
@@ -1633,6 +1937,7 @@ class VaultREPL(cmd.Cmd):
 
     complete_del = complete_delete
     complete_rm = complete_delete
+    complete_edit = complete_delete
 
     def completedefault(self, text, _line, _begidx, _endidx):
         return self._complete_service(text)
@@ -1676,6 +1981,11 @@ def _run_oneshot(args: list[str]):
         cmd_import_vault(args[1])
         return
 
+    # Generating a password doesn't touch the vault — no unlock needed
+    if args[0].lower() == 'gen':
+        cmd_gen(' '.join(args[1:]))
+        return
+
     conn, key = _open_vault(show_banner_on_setup=True)
     session = VaultSession(conn, key)
     _warn_corrupt(session)
@@ -1700,6 +2010,11 @@ def _run_oneshot(args: list[str]):
         cmd_export()
     elif command == 'wipe':
         cmd_wipe(session)
+    elif command == 'edit':
+        if len(args) > 1:
+            cmd_edit(session, args[1])
+        else:
+            print_info("Usage: sofiavault edit <service>")
     elif command in ('delete', 'del', 'rm'):
         if len(args) > 1:
             cmd_delete(session, args[1])

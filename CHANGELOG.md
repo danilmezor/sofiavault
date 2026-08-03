@@ -2,6 +2,24 @@
 
 All notable changes to SofiaVault will be documented in this file.
 
+## [0.2.3] - 2026-08-02
+
+### Added
+- **`edit <service>`** — update an entry in place. Every field shows its
+  current value and Enter keeps it, so rotating one password takes seconds.
+  Supports fuzzy matching, renaming with collision checks, `-` to clear the
+  URL, and preserves the original creation date (an `updated_at` timestamp
+  is stamped inside the encrypted blob). Entries are re-encrypted with a
+  fresh salt and nonce on every edit.
+- **`gen [length] [--mix]`** — strong password generator (default 20 chars,
+  ~124 bits, OS CSPRNG via `secrets`, bias-free rejection sampling). The
+  generated password is copied to the clipboard with the usual auto-clear.
+  With `--mix`, keyboard-mash characters and nanosecond keystroke timings
+  are hashed together with 64 bytes of OS entropy — user input augments the
+  CSPRNG but never replaces it, so a weak mash cannot weaken the result.
+  `edit` offers generation inline when changing a password; `gen` in
+  one-shot mode works without unlocking the vault.
+
 ## [0.2.2] - 2026-08-02
 
 ### Added
