@@ -23,7 +23,7 @@ from sofiavault import (
 def _setup_session():
     tmp = tempfile.mktemp(suffix=".db")
     key = secrets.token_bytes(KEY_SIZE)
-    with patch("sofiavault.DB_PATH", Path(tmp)):
+    with patch("sofiavault.paths.DB_PATH", Path(tmp)):
         conn = init_db()
         save_entry(conn, key, "Amazon", "user@test.com", "oldpass",
                    "https://amazon.com")
@@ -46,7 +46,7 @@ def test_edit_password_only(capsys):
 
     # service, username, url: Enter (keep); generate?: no
     with patch("builtins.input", side_effect=["", "", "", "n"]), \
-         patch("sofiavault.getpass") as gp:
+         patch("sofiavault.cli.getpass") as gp:
         gp.getpass.return_value = "newpass123"
         cmd_edit(session, "amazon")
 
@@ -74,9 +74,9 @@ def test_edit_generate_password(capsys):
     entry = get_entry_by_service(session.entries, "amazon")
 
     with patch("builtins.input", side_effect=["", "", "", "y"]), \
-         patch("sofiavault.getpass") as gp, \
-         patch("sofiavault.copy_to_clipboard", return_value=True), \
-         patch("sofiavault.schedule_clipboard_clear", return_value=True):
+         patch("sofiavault.cli.getpass") as gp, \
+         patch("sofiavault.cli.copy_to_clipboard", return_value=True), \
+         patch("sofiavault.cli.schedule_clipboard_clear", return_value=True):
         gp.getpass.side_effect = AssertionError("must not prompt for password")
         cmd_edit(session, "amazon")
 
@@ -94,7 +94,7 @@ def test_edit_rename_service(capsys):
     entry = get_entry_by_service(session.entries, "amazon")
 
     with patch("builtins.input", side_effect=["AWS", "", "", "n"]), \
-         patch("sofiavault.getpass") as gp:
+         patch("sofiavault.cli.getpass") as gp:
         gp.getpass.return_value = ""
         cmd_edit(session, "amazon")
 
@@ -113,7 +113,7 @@ def test_edit_rename_collision_rejected(capsys):
     row_before = _entry_row(session, get_entry_by_service(session.entries, "amazon").id)
 
     with patch("builtins.input", side_effect=["google"]), \
-         patch("sofiavault.getpass") as gp:
+         patch("sofiavault.cli.getpass") as gp:
         gp.getpass.side_effect = AssertionError("must abort before password")
         cmd_edit(session, "amazon")
 
@@ -133,7 +133,7 @@ def test_edit_no_changes(capsys):
     row_before = _entry_row(session, entry.id)
 
     with patch("builtins.input", side_effect=["", "", "", "n"]), \
-         patch("sofiavault.getpass") as gp:
+         patch("sofiavault.cli.getpass") as gp:
         gp.getpass.return_value = ""  # Enter = keep password
         cmd_edit(session, "amazon")
 
@@ -149,7 +149,7 @@ def test_edit_clear_url(capsys):
     entry = get_entry_by_service(session.entries, "amazon")
 
     with patch("builtins.input", side_effect=["", "", "-", "n"]), \
-         patch("sofiavault.getpass") as gp:
+         patch("sofiavault.cli.getpass") as gp:
         gp.getpass.return_value = ""
         cmd_edit(session, "amazon")
 
@@ -164,7 +164,7 @@ def test_edit_fuzzy_single_match(capsys):
     session, tmp = _setup_session()
 
     with patch("builtins.input", side_effect=["", "", "", "n"]), \
-         patch("sofiavault.getpass") as gp:
+         patch("sofiavault.cli.getpass") as gp:
         gp.getpass.return_value = "rotated"
         cmd_edit(session, "amazn")  # typo — fuzzy resolves to amazon
 
@@ -189,7 +189,7 @@ def test_repl_edit_command(capsys):
     repl = VaultREPL(session)
 
     with patch("builtins.input", side_effect=["", "", "", "n"]), \
-         patch("sofiavault.getpass") as gp:
+         patch("sofiavault.cli.getpass") as gp:
         gp.getpass.return_value = "via-repl"
         repl.onecmd("edit amazon")
 

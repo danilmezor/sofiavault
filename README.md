@@ -199,6 +199,72 @@ Master Password
            service + username + URL + password
 ```
 
+## Using SofiaVault as a Library (servers & apps)
+
+Since 0.3.0, SofiaVault is also a plug-and-play secrets library for
+applications — aimed at replacing the plaintext-`.env` pattern.
+
+### Encrypted app secrets
+
+```python
+from sofiavault import Vault
+
+with Vault.open_auto("/srv/app/secrets.db") as v:
+    token = v.get("telegram-bot")
+```
+
+`open_auto` resolves the key non-interactively (first hit wins):
+`SOFIAVAULT_KEY` (base64, from `sofiavault key`) → `SOFIAVAULT_PASSWORD`
+→ `SOFIAVAULT_KEY_FILE` (0600 key file) → OS keyring (`pip install
+"sofiavault[keyring]"`). It raises `VaultLocked` rather than prompt.
+
+### Drop-in dotenv replacement
+
+```bash
+sofiavault env import .env         # one-time: encrypt your secrets
+sofiavault run -- uvicorn app:main # inject env:* entries, exec the app
+```
+
+Or with one code line at your entry point instead of `load_dotenv()`:
+
+```python
+import sofiavault.envload
+sofiavault.envload.load("/srv/app/secrets.db")
+```
+
+Entries named `env:NAME` become environment variables; variables already
+set in the environment always win (`load()` returns both what it injected
+and what it skipped, so you can log or reject an ambient override).
+Variable names are validated, and loader/interpreter variables
+(`LD_PRELOAD`, `BASH_ENV`, `PYTHONPATH`, `PATH`, ...) are refused — a
+`.env` file is untrusted input, and injecting one of those would turn a
+single vault write into code execution. `sofiavault run` also strips the
+`SOFIAVAULT_*` bootstrap credentials before exec, so the child gets its
+secrets and not the key to the whole vault.
+
+Honest security model: your server still needs one bootstrap secret — but
+it's one secret to guard instead of sixty, everything is encrypted at rest
+with enforced permissions, tampering with the vault file is detected, and
+`git add .env` accidents become non-events.
+
+### Verify-only user authentication
+
+For apps that authenticate their own users, `UserStore` holds Argon2id
+verifiers — it can never reveal a password and needs no master key:
+
+```python
+from sofiavault.auth import UserStore
+
+store = UserStore("/srv/app/users.db")
+store.add_user("alice", "hunter2", access_level=3)
+result = store.verify("alice", submitted)   # AuthResult or None
+```
+
+Never store end-user credentials in the retrievable vault — a breached
+server must yield slow hashes, not decryptable passwords. Migrate a
+legacy plaintext credential file with `sofiavault auth import users.json`
+(then delete the file, purge it from git history, and rotate everything).
+
 ## Using Multiple Devices
 
 The vault is a single encrypted file, so moving it between machines is simple:

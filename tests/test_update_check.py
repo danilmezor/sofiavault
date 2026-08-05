@@ -32,24 +32,24 @@ def _fake_git(responses):
 def test_disabled_via_env_var():
     git = _fake_git({})
     with patch.dict(os.environ, {"SOFIAVAULT_SKIP_UPDATE_CHECK": "1"}), \
-         patch("sofiavault._git", git), \
-         patch("sofiavault._repo_dir", return_value=REPO):
+         patch("sofiavault.cli._git", git), \
+         patch("sofiavault.cli._repo_dir", return_value=REPO):
         check_for_updates()
     assert git.calls == []
 
 
 def test_silent_when_not_a_git_install():
     git = _fake_git({})
-    with patch("sofiavault._git", git), \
-         patch("sofiavault._repo_dir", return_value=None):
+    with patch("sofiavault.cli._git", git), \
+         patch("sofiavault.cli._repo_dir", return_value=None):
         check_for_updates()
     assert git.calls == []
 
 
 def test_silent_when_offline(capsys):
     git = _fake_git({"fetch": None})  # timeout / no network
-    with patch("sofiavault._git", git), \
-         patch("sofiavault._repo_dir", return_value=REPO):
+    with patch("sofiavault.cli._git", git), \
+         patch("sofiavault.cli._repo_dir", return_value=REPO):
         check_for_updates()
     assert capsys.readouterr().out == ""
 
@@ -59,8 +59,8 @@ def test_silent_when_up_to_date(capsys):
         "fetch": _git_result(0),
         "rev-list": _git_result(0, stdout="0\n"),
     })
-    with patch("sofiavault._git", git), \
-         patch("sofiavault._repo_dir", return_value=REPO):
+    with patch("sofiavault.cli._git", git), \
+         patch("sofiavault.cli._repo_dir", return_value=REPO):
         check_for_updates()
     assert capsys.readouterr().out == ""
     assert "log" not in git.calls
@@ -74,9 +74,9 @@ def test_behind_warns_and_user_declines(capsys):
         "rev-parse": _git_result(0, stdout="main\n"),
         "status": _git_result(0, stdout=""),
     })
-    with patch("sofiavault._git", git), \
-         patch("sofiavault._repo_dir", return_value=REPO), \
-         patch("sofiavault._stdin_is_interactive", return_value=True), \
+    with patch("sofiavault.cli._git", git), \
+         patch("sofiavault.cli._repo_dir", return_value=REPO), \
+         patch("sofiavault.cli._stdin_is_interactive", return_value=True), \
          patch("builtins.input", return_value="n"):
         check_for_updates()
 
@@ -98,9 +98,9 @@ def test_behind_user_accepts_pull_and_exit(capsys):
         "status": _git_result(0, stdout=""),
         "pull": _git_result(0, stdout="Fast-forward\n"),
     })
-    with patch("sofiavault._git", git), \
-         patch("sofiavault._repo_dir", return_value=REPO), \
-         patch("sofiavault._stdin_is_interactive", return_value=True), \
+    with patch("sofiavault.cli._git", git), \
+         patch("sofiavault.cli._repo_dir", return_value=REPO), \
+         patch("sofiavault.cli._stdin_is_interactive", return_value=True), \
          patch("builtins.input", return_value=""), \
          pytest.raises(SystemExit) as exc:  # Enter = default Yes
         check_for_updates()
@@ -120,9 +120,9 @@ def test_failed_pull_gives_manual_instructions(capsys):
         "status": _git_result(0, stdout=""),
         "pull": _git_result(1, stderr="fatal: not possible to fast-forward\n"),
     })
-    with patch("sofiavault._git", git), \
-         patch("sofiavault._repo_dir", return_value=REPO), \
-         patch("sofiavault._stdin_is_interactive", return_value=True), \
+    with patch("sofiavault.cli._git", git), \
+         patch("sofiavault.cli._repo_dir", return_value=REPO), \
+         patch("sofiavault.cli._stdin_is_interactive", return_value=True), \
          patch("builtins.input", return_value="y"):
         check_for_updates()  # must NOT raise SystemExit
 
@@ -139,9 +139,9 @@ def test_dirty_tree_never_auto_pulls(capsys):
         "rev-parse": _git_result(0, stdout="main\n"),
         "status": _git_result(0, stdout=" M sofiavault.py\n"),
     })
-    with patch("sofiavault._git", git), \
-         patch("sofiavault._repo_dir", return_value=REPO), \
-         patch("sofiavault._stdin_is_interactive", return_value=True), \
+    with patch("sofiavault.cli._git", git), \
+         patch("sofiavault.cli._repo_dir", return_value=REPO), \
+         patch("sofiavault.cli._stdin_is_interactive", return_value=True), \
          patch("builtins.input", side_effect=AssertionError("must not prompt")):
         check_for_updates()
 
@@ -158,9 +158,9 @@ def test_non_main_branch_never_auto_pulls(capsys):
         "rev-parse": _git_result(0, stdout="feature-branch\n"),
         "status": _git_result(0, stdout=""),
     })
-    with patch("sofiavault._git", git), \
-         patch("sofiavault._repo_dir", return_value=REPO), \
-         patch("sofiavault._stdin_is_interactive", return_value=True), \
+    with patch("sofiavault.cli._git", git), \
+         patch("sofiavault.cli._repo_dir", return_value=REPO), \
+         patch("sofiavault.cli._stdin_is_interactive", return_value=True), \
          patch("builtins.input", side_effect=AssertionError("must not prompt")):
         check_for_updates()
 
@@ -175,9 +175,9 @@ def test_non_interactive_warns_without_prompting(capsys):
         "rev-list": _git_result(0, stdout="1\n"),
         "log": _git_result(0, stdout="Security fix\n"),
     })
-    with patch("sofiavault._git", git), \
-         patch("sofiavault._repo_dir", return_value=REPO), \
-         patch("sofiavault._stdin_is_interactive", return_value=False), \
+    with patch("sofiavault.cli._git", git), \
+         patch("sofiavault.cli._repo_dir", return_value=REPO), \
+         patch("sofiavault.cli._stdin_is_interactive", return_value=False), \
          patch("builtins.input", side_effect=AssertionError("must not prompt")):
         check_for_updates()
 

@@ -32,7 +32,7 @@ def _key():
 
 def test_init_db_creates_tables():
     tmp = _temp_db()
-    with patch("sofiavault.DB_PATH", Path(tmp)):
+    with patch("sofiavault.paths.DB_PATH", Path(tmp)):
         conn = init_db()
         cur = conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
@@ -51,7 +51,7 @@ def test_db_file_permissions_restricted():
     if sys.platform == "win32":
         return  # POSIX permission bits are not meaningful on Windows
     tmp = _temp_db()
-    with patch("sofiavault.DB_PATH", Path(tmp)):
+    with patch("sofiavault.paths.DB_PATH", Path(tmp)):
         conn = init_db()
         conn.close()
         mode = stat.S_IMODE(Path(tmp).stat().st_mode)
@@ -61,7 +61,7 @@ def test_db_file_permissions_restricted():
 
 def test_vault_not_initialized_initially():
     tmp = _temp_db()
-    with patch("sofiavault.DB_PATH", Path(tmp)):
+    with patch("sofiavault.paths.DB_PATH", Path(tmp)):
         conn = init_db()
         assert is_vault_initialized(conn) is False
         conn.close()
@@ -70,7 +70,7 @@ def test_vault_not_initialized_initially():
 
 def test_save_and_verify_master():
     tmp = _temp_db()
-    with patch("sofiavault.DB_PATH", Path(tmp)):
+    with patch("sofiavault.paths.DB_PATH", Path(tmp)):
         conn = init_db()
         salt = secrets.token_bytes(32)
         verify_hash = secrets.token_bytes(32)
@@ -88,7 +88,7 @@ def test_save_and_verify_master():
 def test_save_and_retrieve_entry():
     tmp = _temp_db()
     key = _key()
-    with patch("sofiavault.DB_PATH", Path(tmp)):
+    with patch("sofiavault.paths.DB_PATH", Path(tmp)):
         conn = init_db()
         entry_id = save_entry(
             conn, key, "Amazon", "user@test.com", "pass123", "https://amazon.com"
@@ -110,7 +110,7 @@ def test_save_and_retrieve_entry():
 def test_metadata_is_not_stored_in_plaintext():
     tmp = _temp_db()
     key = _key()
-    with patch("sofiavault.DB_PATH", Path(tmp)):
+    with patch("sofiavault.paths.DB_PATH", Path(tmp)):
         conn = init_db()
         save_entry(conn, key, "amazonsecret", "hidden@user.example",
                    "topsecretpw", "https://hidden.example")
@@ -127,7 +127,7 @@ def test_metadata_is_not_stored_in_plaintext():
 def test_wrong_key_cannot_read_entries():
     tmp = _temp_db()
     key = _key()
-    with patch("sofiavault.DB_PATH", Path(tmp)):
+    with patch("sofiavault.paths.DB_PATH", Path(tmp)):
         conn = init_db()
         entry_id = save_entry(conn, key, "Amazon", "user", "pass123")
 
@@ -142,7 +142,7 @@ def test_wrong_key_cannot_read_entries():
 def test_tampered_entry_fails_decryption():
     tmp = _temp_db()
     key = _key()
-    with patch("sofiavault.DB_PATH", Path(tmp)):
+    with patch("sofiavault.paths.DB_PATH", Path(tmp)):
         conn = init_db()
         entry_id = save_entry(conn, key, "Amazon", "user", "pass123")
 
@@ -167,7 +167,7 @@ def test_tampered_entry_fails_decryption():
 def test_get_all_entries_sorted():
     tmp = _temp_db()
     key = _key()
-    with patch("sofiavault.DB_PATH", Path(tmp)):
+    with patch("sofiavault.paths.DB_PATH", Path(tmp)):
         conn = init_db()
         save_entry(conn, key, "Netflix", "u3", "p3")
         save_entry(conn, key, "Amazon", "u1", "p1")
@@ -183,7 +183,7 @@ def test_get_all_entries_sorted():
 def test_delete_entry():
     tmp = _temp_db()
     key = _key()
-    with patch("sofiavault.DB_PATH", Path(tmp)):
+    with patch("sofiavault.paths.DB_PATH", Path(tmp)):
         conn = init_db()
         save_entry(conn, key, "ToDelete", "user", "pass")
 
@@ -191,7 +191,7 @@ def test_delete_entry():
         entry = get_entry_by_service(entries, "todelete")
         assert entry is not None
 
-        delete_entry(conn, entry.id)
+        delete_entry(conn, entry.id, key)
         entries, _ = load_entries(conn, key)
         assert get_entry_by_service(entries, "todelete") is None
         conn.close()
@@ -201,7 +201,7 @@ def test_delete_entry():
 def test_nonexistent_service_returns_none():
     tmp = _temp_db()
     key = _key()
-    with patch("sofiavault.DB_PATH", Path(tmp)):
+    with patch("sofiavault.paths.DB_PATH", Path(tmp)):
         conn = init_db()
         entries, _ = load_entries(conn, key)
         assert get_entry_by_service(entries, "nonexistent") is None

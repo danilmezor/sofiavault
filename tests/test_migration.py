@@ -56,7 +56,7 @@ def test_migration_preserves_all_entries(capsys):
     tmp = tempfile.mktemp(suffix=".db")
     key = secrets.token_bytes(KEY_SIZE)
 
-    with patch("sofiavault.DB_PATH", Path(tmp)):
+    with patch("sofiavault.paths.DB_PATH", Path(tmp)):
         conn = init_db()
         conn.execute(V1_SCHEMA)
         _insert_v1_entry(conn, key, "Amazon", "user@test.com", "pass123",
@@ -102,7 +102,7 @@ def test_migration_keeps_undecryptable_rows(capsys):
     tmp = tempfile.mktemp(suffix=".db")
     key = secrets.token_bytes(KEY_SIZE)
 
-    with patch("sofiavault.DB_PATH", Path(tmp)):
+    with patch("sofiavault.paths.DB_PATH", Path(tmp)):
         conn = init_db()
         conn.execute(V1_SCHEMA)
         _insert_v1_entry(conn, key, "Good", "user", "goodpass")
@@ -137,7 +137,7 @@ def test_migration_noop_on_fresh_vault(capsys):
     tmp = tempfile.mktemp(suffix=".db")
     key = secrets.token_bytes(KEY_SIZE)
 
-    with patch("sofiavault.DB_PATH", Path(tmp)):
+    with patch("sofiavault.paths.DB_PATH", Path(tmp)):
         conn = init_db()
         migrate_legacy_vault(conn, key)  # must not raise or create a backup
         assert not Path(tmp + ".v1-backup").exists()
@@ -153,7 +153,7 @@ def test_migration_drops_empty_legacy_table(capsys):
     tmp = tempfile.mktemp(suffix=".db")
     key = secrets.token_bytes(KEY_SIZE)
 
-    with patch("sofiavault.DB_PATH", Path(tmp)):
+    with patch("sofiavault.paths.DB_PATH", Path(tmp)):
         conn = init_db()
         conn.execute(V1_SCHEMA)
         conn.commit()
@@ -170,7 +170,7 @@ def test_migration_is_idempotent(capsys):
     tmp = tempfile.mktemp(suffix=".db")
     key = secrets.token_bytes(KEY_SIZE)
 
-    with patch("sofiavault.DB_PATH", Path(tmp)):
+    with patch("sofiavault.paths.DB_PATH", Path(tmp)):
         conn = init_db()
         conn.execute(V1_SCHEMA)
         _insert_v1_entry(conn, key, "Amazon", "user", "pass123")

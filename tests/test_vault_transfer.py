@@ -32,7 +32,7 @@ MASTER_PW = "transfer-test-pw"
 def _make_vault(db_path: str, master_password: str = MASTER_PW,
                 entries: bool = True):
     """Create a real vault file with a master password and optional entries."""
-    with patch("sofiavault.DB_PATH", Path(db_path)):
+    with patch("sofiavault.paths.DB_PATH", Path(db_path)):
         conn = init_db()
         salt = secrets.token_bytes(SALT_SIZE)
         key = derive_key(master_password, salt)
@@ -71,7 +71,7 @@ def test_is_vault_file_false_for_garbage_and_missing():
 
 def test_is_vault_file_false_for_uninitialized_db():
     tmp = tempfile.mktemp(suffix=".db")
-    with patch("sofiavault.DB_PATH", Path(tmp)):
+    with patch("sofiavault.paths.DB_PATH", Path(tmp)):
         init_db().close()  # tables exist but no master password set
     assert _is_vault_file(Path(tmp)) is False
     Path(tmp).unlink(missing_ok=True)
@@ -82,7 +82,7 @@ def test_is_vault_file_false_for_uninitialized_db():
 def test_export_prints_path_and_uri(capsys):
     tmp = tempfile.mktemp(suffix=".db")
     _make_vault(tmp)
-    with patch("sofiavault.DB_PATH", Path(tmp)):
+    with patch("sofiavault.paths.DB_PATH", Path(tmp)):
         cmd_export()
     out = capsys.readouterr().out
     assert tmp in out
@@ -92,7 +92,7 @@ def test_export_prints_path_and_uri(capsys):
 
 
 def test_export_without_vault(capsys):
-    with patch("sofiavault.DB_PATH", Path("/nonexistent/vault.db")):
+    with patch("sofiavault.paths.DB_PATH", Path("/nonexistent/vault.db")):
         cmd_export()
     assert "nothing to export" in capsys.readouterr().out.lower()
 
@@ -104,8 +104,8 @@ def test_import_vault_to_fresh_device(capsys):
     dest = Path(tempfile.mkdtemp()) / "vault.db"
     key = _make_vault(src)
 
-    with patch("sofiavault.DB_PATH", dest), \
-         patch("sofiavault.getpass") as gp:
+    with patch("sofiavault.paths.DB_PATH", dest), \
+         patch("sofiavault.cli.getpass") as gp:
         gp.getpass.return_value = MASTER_PW
         assert cmd_import_vault(src) is True
         assert dest.exists()
@@ -130,8 +130,8 @@ def test_import_vault_wrong_password_changes_nothing(capsys):
     dest = Path(tempfile.mkdtemp()) / "vault.db"
     _make_vault(src)
 
-    with patch("sofiavault.DB_PATH", dest), \
-         patch("sofiavault.getpass") as gp:
+    with patch("sofiavault.paths.DB_PATH", dest), \
+         patch("sofiavault.cli.getpass") as gp:
         gp.getpass.return_value = "wrong password"
         assert cmd_import_vault(src) is False
         assert not dest.exists()
@@ -148,8 +148,8 @@ def test_import_vault_over_existing_creates_backup(capsys):
     _make_vault(str(dest), master_password="old-local-pw")
     old_bytes = dest.read_bytes()
 
-    with patch("sofiavault.DB_PATH", dest), \
-         patch("sofiavault.getpass") as gp, \
+    with patch("sofiavault.paths.DB_PATH", dest), \
+         patch("sofiavault.cli.getpass") as gp, \
          patch("builtins.input", return_value="y"):
         gp.getpass.return_value = "new-device-pw"
         assert cmd_import_vault(src) is True
@@ -171,8 +171,8 @@ def test_import_vault_over_existing_declined(capsys):
     _make_vault(str(dest), master_password="old-local-pw")
     old_bytes = dest.read_bytes()
 
-    with patch("sofiavault.DB_PATH", dest), \
-         patch("sofiavault.getpass") as gp, \
+    with patch("sofiavault.paths.DB_PATH", dest), \
+         patch("sofiavault.cli.getpass") as gp, \
          patch("builtins.input", return_value="n"):
         gp.getpass.return_value = MASTER_PW
         assert cmd_import_vault(src) is False
@@ -185,7 +185,7 @@ def test_import_vault_over_existing_declined(capsys):
 def test_import_rejects_non_vault_file(capsys):
     tmp = tempfile.mktemp(suffix=".db")
     Path(tmp).write_bytes(b"garbage")
-    with patch("sofiavault.DB_PATH", Path(tempfile.mkdtemp()) / "vault.db"):
+    with patch("sofiavault.paths.DB_PATH", Path(tempfile.mkdtemp()) / "vault.db"):
         assert cmd_import_vault(tmp) is False
     assert "not a sofiavault vault" in capsys.readouterr().out.lower()
     Path(tmp).unlink(missing_ok=True)
@@ -231,9 +231,9 @@ def test_wipe_destroys_vault_and_exits(capsys):
     history = tmpdir / ".history"
     history.write_text("amazon\n")
 
-    with patch("sofiavault.DB_PATH", db), \
-         patch("sofiavault.HISTORY_PATH", history), \
-         patch("sofiavault.getpass") as gp, \
+    with patch("sofiavault.paths.DB_PATH", db), \
+         patch("sofiavault.paths.HISTORY_PATH", history), \
+         patch("sofiavault.cli.getpass") as gp, \
          patch("builtins.input", return_value="wipe my vault"), \
          pytest.raises(SystemExit) as exc:
         gp.getpass.return_value = MASTER_PW
@@ -251,8 +251,8 @@ def test_wipe_wrong_password_aborts(capsys):
     tmpdir = Path(tempfile.mkdtemp())
     session, db = _wipe_session(tmpdir)
 
-    with patch("sofiavault.DB_PATH", db), \
-         patch("sofiavault.getpass") as gp, \
+    with patch("sofiavault.paths.DB_PATH", db), \
+         patch("sofiavault.cli.getpass") as gp, \
          patch("builtins.input", side_effect=AssertionError("must not confirm")):
         gp.getpass.return_value = "wrong password"
         cmd_wipe(session)  # returns, no SystemExit
@@ -268,8 +268,8 @@ def test_wipe_wrong_phrase_aborts(capsys):
     tmpdir = Path(tempfile.mkdtemp())
     session, db = _wipe_session(tmpdir)
 
-    with patch("sofiavault.DB_PATH", db), \
-         patch("sofiavault.getpass") as gp, \
+    with patch("sofiavault.paths.DB_PATH", db), \
+         patch("sofiavault.cli.getpass") as gp, \
          patch("builtins.input", return_value="yes please"):
         gp.getpass.return_value = MASTER_PW
         cmd_wipe(session)
@@ -286,9 +286,9 @@ def test_wipe_only_touches_allowlisted_files(capsys):
     bystander = tmpdir / "unrelated-file.txt"
     bystander.write_text("do not touch me")
 
-    with patch("sofiavault.DB_PATH", db), \
-         patch("sofiavault.HISTORY_PATH", tmpdir / ".history"), \
-         patch("sofiavault.getpass") as gp, \
+    with patch("sofiavault.paths.DB_PATH", db), \
+         patch("sofiavault.paths.HISTORY_PATH", tmpdir / ".history"), \
+         patch("sofiavault.cli.getpass") as gp, \
          patch("builtins.input", return_value="wipe my vault"), \
          pytest.raises(SystemExit):
         gp.getpass.return_value = MASTER_PW

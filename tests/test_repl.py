@@ -19,7 +19,7 @@ def _setup_session():
     tmp = tempfile.mktemp(suffix=".db")
     key = secrets.token_bytes(KEY_SIZE)
 
-    with patch("sofiavault.DB_PATH", Path(tmp)):
+    with patch("sofiavault.paths.DB_PATH", Path(tmp)):
         conn = init_db()
         save_entry(conn, key, "Amazon", "user@test.com", "pass123")
         save_entry(conn, key, "Google", "user2@test.com", "pass456")
@@ -83,8 +83,8 @@ def test_repl_default_get_hides_password_when_copied(capsys):
     session, tmp = _setup_session()
     repl = VaultREPL(session)
 
-    with patch("sofiavault.copy_to_clipboard", return_value=True), \
-         patch("sofiavault.schedule_clipboard_clear", return_value=True):
+    with patch("sofiavault.cli.copy_to_clipboard", return_value=True), \
+         patch("sofiavault.cli.schedule_clipboard_clear", return_value=True):
         repl.onecmd("amazon")
 
     captured = capsys.readouterr()
@@ -100,8 +100,8 @@ def test_repl_show_displays_password(capsys):
     session, tmp = _setup_session()
     repl = VaultREPL(session)
 
-    with patch("sofiavault.copy_to_clipboard", return_value=True), \
-         patch("sofiavault.schedule_clipboard_clear", return_value=True):
+    with patch("sofiavault.cli.copy_to_clipboard", return_value=True), \
+         patch("sofiavault.cli.schedule_clipboard_clear", return_value=True):
         repl.onecmd("show amazon")
 
     captured = capsys.readouterr()
@@ -115,7 +115,7 @@ def test_repl_get_falls_back_to_display_without_clipboard(capsys):
     session, tmp = _setup_session()
     repl = VaultREPL(session)
 
-    with patch("sofiavault.copy_to_clipboard", return_value=False):
+    with patch("sofiavault.cli.copy_to_clipboard", return_value=False):
         repl.onecmd("amazon")
 
     captured = capsys.readouterr()
@@ -192,7 +192,7 @@ def test_expired_session_drops_key_from_memory(capsys):
     session.last_activity = 0  # force expiry
 
     # Failed re-auth: key and decrypted index must be gone
-    with patch("sofiavault.unlock_vault", return_value=None):
+    with patch("sofiavault.cli.unlock_vault", return_value=None):
         assert repl._check_lock() is False
     assert session.key is None
     assert session.entries == []
@@ -207,7 +207,7 @@ def test_expired_session_restored_after_reauth(capsys):
     repl = VaultREPL(session)
     session.last_activity = 0  # force expiry
 
-    with patch("sofiavault.unlock_vault", return_value=key):
+    with patch("sofiavault.cli.unlock_vault", return_value=key):
         assert repl._check_lock() is True
     assert session.key == key
     assert len(session.entries) == 2

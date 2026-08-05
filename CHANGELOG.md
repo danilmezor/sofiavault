@@ -2,6 +2,135 @@
 
 All notable changes to SofiaVault will be documented in this file.
 
+## [0.3.0] - 2026-08-05
+
+SofiaVault is now a plug-and-play library as well as a CLI. The design is
+aimed at the countless production apps built on the dotenv pattern —
+plaintext `.env` files full of secrets, injected wholesale into containers.
+
+### Added
+- **Library API** (`from sofiavault import Vault`): silent, importable,
+  typed exceptions (`WrongPassword`, `VaultLocked`, `EntryNotFound`, ...).
+  `Vault.create/open/open_auto`, `get/get_entry/set/delete/list_entries/
+  search`, `export_key`, context-manager support. Importing the package
+  never prompts, prints, or touches the network.
+- **Non-interactive unlock** for servers via `Vault.open_auto()`:
+  `SOFIAVAULT_KEY` (base64 raw key) → `SOFIAVAULT_PASSWORD` →
+  `SOFIAVAULT_KEY_FILE` → OS keyring (optional `keyring` extra) →
+  `VaultLocked`. The library never falls back to a prompt.
+- **Environment injection** (`sofiavault.envload`): entries named
+  `env:NAME` inject as environment variables. One line replaces
+  `load_dotenv()`; existing variables are never overwritten by default.
+  - `sofiavault env import <.env>` bulk-imports a dotenv file (with a
+    warning to scrub and rotate the plaintext source).
+  - `sofiavault env list` shows what would be injected.
+  - `sofiavault run [--vault PATH] -- <cmd>` resolves the key, injects
+    `env:*` entries, and execs the command — zero code changes required;
+    secrets never touch disk unencrypted or appear in `env_file` dumps.
+  - `sofiavault key` prints the base64 master key once, for provisioning.
+- **Verify-only user store** (`from sofiavault.auth import UserStore`):
+  Argon2id credential verification for apps that authenticate their own
+  users. Can never produce a plaintext password and needs no master key.
+  Per-user salts and cost parameters with transparent rehash-on-verify,
+  anti-enumeration dummy hashing, optional pepper (no default value —
+  ever), optional AES-GCM encryption of profile fields at rest, and
+  `import_json` / `sofiavault auth import` for migrating legacy plaintext
+  credential files (with an explicit rotate-everything warning).
+
+### Security (hardening found in pre-release review of the new surface)
+- **Environment injection is validated.** Variable names must be
+  well-formed, and dangerous variables are refused at both import and
+  inject time — otherwise a single vault write became code execution in
+  every process the vault configured.
+  - `envload.load(..., allow=[...])` restricts injection to the variables
+    the application actually consumes. This is the recommended gate: it is
+    the only one that does not have to anticipate the attacker's choice of
+    variable. Names outside the allowlist are ignored, but a *dangerous*
+    one still raises rather than passing unnoticed.
+  - Without `allow=`, a denylist applies. It now covers git command hooks
+    (`GIT_SSH_COMMAND`, `GIT_CONFIG_*`, ...), TLS trust and proxies
+    (`SSL_CERT_FILE`, `NODE_TLS_REJECT_UNAUTHORIZED`, `*_PROXY`), home and
+    config redirection (`HOME`, `XDG_*`, `TMPDIR`), cloud credential
+    plugins (`AWS_CONFIG_FILE`, `KUBECONFIG`), package-manager registries,
+    pager hooks (`LESSOPEN`) and the Windows set — alongside the original
+    loader/interpreter names. Ordinary secrets (`AWS_SECRET_ACCESS_KEY`,
+    `PGPASSWORD`, `DATABASE_URL`, ...) are unaffected.
+  - `.env` parsing consumes multiline quoted values whole. Previously the
+    continuation lines of a pasted PEM block were parsed as fresh
+    `NAME=value` pairs, so a `GIT_SSH_COMMAND=` line hidden inside key
+    material became a real variable. An unterminated quote is now a hard
+    `MalformedEnvFile` error and imports nothing.
+  - `sofiavault run` resolves the program against the pre-injection
+    `PATH`, so a vault entry can never choose which binary is executed.
+- **`sofiavault run` no longer leaks the master key to the child.** The
+  `SOFIAVAULT_KEY` / `SOFIAVAULT_PASSWORD` / `SOFIAVAULT_KEY_FILE`
+  variables are stripped before exec, so a compromised child holds only
+  the secrets it was scoped to receive.
+- **Tamper-evident storage (schema v3).** Entry blobs are now
+  authenticated against their row id and a per-vault id, and the vault
+  keeps a MAC over the whole entry set. Rolling back a rotated secret,
+  inserting a shadow row, deleting a row, and transplanting blobs between
+  vaults sharing a master key are all detected. Existing vaults upgrade
+  automatically and losslessly on first open.
+  - The MAC cannot be stripped. It is written when the master password is
+    created, a v3 vault is *required* to carry one, and the MAC covers
+    `schema_version` and `vault_id` as well as the rows. Previously an
+    attacker with write access could delete one unauthenticated
+    `vault_meta` row — or roll `schema_version` back to `2`, which made
+    the v2→v3 migration re-sign whatever the rows then held — and every
+    rollback defence above went quiet.
+  - `storage.delete_entry()` now requires the master key; the keyless form
+    used to clear the MAC outright.
+- **Fail closed on tampering.** A corrupted entry used to surface as
+  `EntryNotFound` (a `KeyError`), which an application's
+  `except KeyError: use_default()` would read as "never configured" — a
+  silent security downgrade. It now raises `VaultCorrupted`, and
+  `envload.load()` refuses to inject a partial environment. `load()` also
+  checks the entry-set MAC directly: a deleted `env:*` row leaves every
+  survivor decryptable, so it shows up as tampering rather than
+  corruption, and an application would otherwise have fallen back to its
+  default for the missing variable.
+- **UserStore anti-enumeration survives cost upgrades.** Verification
+  spends the same work whether or not the user exists. The decoy is priced
+  at the *ceiling* of the stored parameters and current defaults, and a row
+  whose stored cost is below that ceiling pays the difference before the
+  comparison branch. Pricing the decoy from the cheapest stored row, as an
+  earlier build did, made a single probe distinguish real users from
+  unknown ones at 7x; pricing it from the ceiling alone merely inverted the
+  tell. Measured spread across unknown / inactive / wrong-password /
+  legacy-row accounts is now ~1.1x.
+- **Stored Argon2 parameters are validated on read**, so a tampered row
+  cannot wedge or OOM verification with an absurd `memory_cost`, and a
+  successful login never *lowers* cost parameters an operator raised.
+- **Encrypted profile fields cannot be downgraded to plaintext.** The
+  store records whether it encrypts fields; a row presenting plaintext in
+  an encrypting store is refused. Previously, setting `fields_enc` to NULL
+  and writing `{"role": "admin"}` into the plaintext column granted the
+  fields without touching a password hash or knowing the field key.
+- **Profile fields are bound to their user** (AES-GCM associated data),
+  and `is_active` is read strictly, so a tampered row cannot graft an
+  admin's fields onto another account or revive a revoked one.
+- **Username identity policy**: NFKC-normalized and casefolded, with
+  control/format characters rejected — no more `Admin`/`ADMIN`/`ａdmin`
+  shadow accounts or log-forging usernames.
+- Files are created 0600 before anything can open them (no
+  world-readable window), key files with group/other access are refused,
+  `envload.load()` reports what it skipped, `import_json` refuses to
+  coerce non-string passwords, malformed master records raise a typed
+  error, and destructive helpers are out of the public API.
+
+### Changed
+- The single-file module is now a package (`core`, `storage`, `vault`,
+  `auth`, `envload`, `generator`, `cli`) with the historical flat import
+  surface preserved (`from sofiavault import derive_key, ...`).
+- `Vault` and `UserStore` serialize access internally, so a single
+  instance can be shared by a threaded server.
+- `envload.load()` returns `(injected, skipped)` and
+  `import_env_file()` returns `(imported, skipped, rejected)`.
+- The entire CLI UX is unchanged; existing vaults and symlink installs
+  keep working (a root launcher script preserves `setup.sh` /
+  `install.py` installs).
+
 ## [0.2.3] - 2026-08-02
 
 ### Added

@@ -50,8 +50,8 @@ def test_password_from_pool_no_modulo_bias_structure():
 
 def _generated_password(arg=""):
     """Run cmd_gen and capture the password it copied to the clipboard."""
-    with patch("sofiavault.copy_to_clipboard", return_value=True) as clip, \
-         patch("sofiavault.schedule_clipboard_clear", return_value=True):
+    with patch("sofiavault.cli.copy_to_clipboard", return_value=True) as clip, \
+         patch("sofiavault.cli.schedule_clipboard_clear", return_value=True):
         cmd_gen(arg)
     return clip.call_args[0][0]
 
@@ -76,10 +76,10 @@ def test_cmd_gen_clamps_length(capsys):
 
 
 def test_cmd_gen_mix_uses_user_entropy(capsys):
-    with patch("sofiavault._collect_user_entropy",
+    with patch("sofiavault.cli._collect_user_entropy",
                return_value=b"mash" * 32) as collect, \
-         patch("sofiavault.copy_to_clipboard", return_value=True) as clip, \
-         patch("sofiavault.schedule_clipboard_clear", return_value=True):
+         patch("sofiavault.cli.copy_to_clipboard", return_value=True) as clip, \
+         patch("sofiavault.cli.schedule_clipboard_clear", return_value=True):
         cmd_gen("--mix")
 
     collect.assert_called_once()
@@ -92,9 +92,9 @@ def test_cmd_gen_mix_uses_user_entropy(capsys):
 def test_cmd_gen_mix_never_deterministic_from_user_seed(capsys):
     """Same user input twice must NOT produce the same password —
     the OS CSPRNG contribution guarantees it."""
-    with patch("sofiavault._collect_user_entropy", return_value=b"same-seed"), \
-         patch("sofiavault.copy_to_clipboard", return_value=True) as clip, \
-         patch("sofiavault.schedule_clipboard_clear", return_value=True):
+    with patch("sofiavault.cli._collect_user_entropy", return_value=b"same-seed"), \
+         patch("sofiavault.cli.copy_to_clipboard", return_value=True) as clip, \
+         patch("sofiavault.cli.schedule_clipboard_clear", return_value=True):
         cmd_gen("--mix")
         first = clip.call_args[0][0]
         cmd_gen("--mix")
@@ -103,7 +103,7 @@ def test_cmd_gen_mix_never_deterministic_from_user_seed(capsys):
 
 
 def test_cmd_gen_bad_args(capsys):
-    with patch("sofiavault.copy_to_clipboard") as clip:
+    with patch("sofiavault.cli.copy_to_clipboard") as clip:
         cmd_gen("--bogus")
     clip.assert_not_called()
     assert "Usage" in capsys.readouterr().out

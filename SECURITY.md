@@ -69,6 +69,13 @@ the vault is upgraded automatically:
 
 1. The original database file is backed up to `~/.sofiavault/vault.db.v1-backup`
    (permissions 0600) before anything is modified.
+
+   **Keep this in mind:** that backup is a v1 file, so it still contains
+   plaintext service names, usernames, and URLs, plus the pre-migration
+   ciphertext of every password under your master password. Deleting or
+   rotating a secret afterwards does not remove it from the backup, and
+   the backup rides along into Time Machine / rsync / cloud-sync copies.
+   Delete it once you have confirmed the upgrade worked.
 2. Every entry is decrypted with the legacy scheme and re-encrypted into the
    new format inside a single transaction — an interruption rolls back cleanly.
 3. Entries that fail to decrypt are left untouched and reported, never dropped.
@@ -77,6 +84,46 @@ the vault is upgraded automatically:
 The master password and its verification data are unchanged; your existing
 master password continues to work. After verifying the upgrade you may delete
 the `.v1-backup` file — it still contains the old plaintext metadata.
+
+## Server / Library Mode (0.3.0)
+
+- **Bootstrap secret**: a server unlocking the vault non-interactively
+  needs one credential (`SOFIAVAULT_KEY`, `SOFIAVAULT_PASSWORD`, a 0600
+  key file, or the OS keyring). SofiaVault reduces N plaintext secrets to
+  one well-guarded secret; it does not eliminate the last secret. Root on
+  the running host can still win — full-disk encryption and OS access
+  control remain the backstop.
+- **The library never prompts, prints, or touches the network.** All
+  interactivity (including the update check) lives in the CLI.
+- **UserStore is verify-only**: per-user Argon2id verifiers with salts
+  and stored cost parameters, constant-time comparison, transparent
+  rehash-on-verify, and dummy hashing for unknown/inactive usernames.
+  There is no code path that returns a user's password. Rate limiting,
+  lockout, sessions, and 2FA are deliberately the calling application's
+  responsibility.
+- **Anti-enumeration, stated precisely:** the decoy hash for an unknown
+  user is priced using the *cheapest cost parameters actually stored in
+  that database*, so it stays indistinguishable from a real verification
+  even after a cost upgrade leaves older rows behind. `add_user()` is
+  deliberately not constant-time (it returns False for an existing name)
+  — it is an administrative call and must not back a self-service signup
+  route without the caller adding its own timing/response equalization.
+- **Tamper evidence:** each entry blob is authenticated against its row
+  id and a per-vault id, and the vault stores a MAC over the whole entry
+  set. Restoring an old blob into its own row (rolling back a rotated
+  secret), inserting a shadow row, deleting a row, or transplanting a
+  blob between vaults that share a master key are all detected, and the
+  vault then fails closed rather than serving a stale or missing secret.
+- **Environment injection is not a trusted channel:** variable names are
+  validated, and loader/interpreter variables (`LD_PRELOAD`, `BASH_ENV`,
+  `PYTHONPATH`, `PATH`, ...) are refused, so a single vault write cannot
+  become code execution in every process the vault configures.
+  `sofiavault run` also strips the `SOFIAVAULT_*` bootstrap credentials
+  before exec, so a compromised child gets only the secrets it was
+  scoped to receive — not the key to the whole vault.
+- **Never store end-user credentials in the retrievable vault.** The
+  vault exists for secrets the app must read back (API keys, tokens);
+  user passwords must only ever be stored as hashes.
 
 ## Vault Wipe
 

@@ -16,7 +16,7 @@ from sofiavault import (
 
 
 def _make_session(db_tmp: str) -> VaultSession:
-    with patch("sofiavault.DB_PATH", Path(db_tmp)):
+    with patch("sofiavault.paths.DB_PATH", Path(db_tmp)):
         conn = init_db()
     return VaultSession(conn, secrets.token_bytes(KEY_SIZE))
 

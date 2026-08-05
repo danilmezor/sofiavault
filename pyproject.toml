@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sofiavault"
-version = "0.2.3"
+version = "0.3.0"
 description = "A secure terminal password manager with fuzzy matching"
 readme = "README.md"
 license = "MIT"
@@ -35,9 +35,12 @@ dev = [
     "pytest>=7.0",
     "ruff>=0.4.0",
 ]
+keyring = [
+    "keyring>=24.0",
+]
 
 [project.scripts]
-sofiavault = "sofiavault:main"
+sofiavault = "sofiavault.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/danilmezor/sofiavault"
@@ -45,7 +48,7 @@ Repository = "https://github.com/danilmezor/sofiavault"
 Issues = "https://github.com/danilmezor/sofiavault/issues"
 
 [tool.setuptools]
-py-modules = ["sofiavault"]
+packages = ["sofiavault"]
 
 [tool.ruff]
 line-length = 100
