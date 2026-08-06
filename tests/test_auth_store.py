@@ -5,6 +5,7 @@ import os
 import secrets
 import sqlite3
 import stat
+import statistics
 import sys
 import tempfile
 import threading
@@ -18,6 +19,7 @@ from sofiavault.auth import (
     AuthStoreError,
     InvalidUsername,
     UserStore,
+    _padding_costs,
     normalize_username,
 )
 from sofiavault.core import (
@@ -562,3 +564,133 @@ def _is_closed(conn) -> bool:
     except sqlite3.ProgrammingError:
         return True
     return False
+
+
+# ── Residual findings from the second audit pass ─────────────────────────────
+
+def _tmp_store_path() -> Path:
+    return Path(tempfile.mkdtemp()) / "users.db"
+
+
+def test_decoy_ceiling_sees_writes_from_another_instance():
+    """Each gunicorn/uwsgi worker holds its own UserStore.
+
+    Invalidating the ceiling cache only on the instance's *own* writes left
+    every other worker priced at a stale, lower ceiling — an 11x "fast means
+    does-not-exist" oracle, the very thing the ceiling exists to close.
+    """
+    path = _tmp_store_path()
+    a = UserStore(path)
+    a.add_user("alice", "alice-pw")
+    assert a._dummy_costs() == (ARGON2_TIME_COST, ARGON2_MEMORY_COST,
+                                ARGON2_PARALLELISM)
+
+    b = UserStore(path)
+    b.add_user("heavy", "heavy-pw")
+    b._conn.execute("UPDATE users SET time_cost = 8, memory_cost = 262144"
+                    " WHERE username = 'heavy'")
+    b._conn.commit()
+
+    # a never wrote the heavy row, but must still price its decoy from it
+    assert a._dummy_costs() == (8, 262144, ARGON2_PARALLELISM)
+    a.close()
+    b.close()
+
+
+@pytest.mark.parametrize("column,value", [
+    ("salt", "not-bytes"),
+    ("salt", 0),
+    ("salt", b"tooshort"),
+    ("verify_hash", "not-bytes"),
+    ("verify_hash", 7),
+    ("verify_hash", b"short"),
+])
+def test_tampered_binary_columns_raise_the_stores_own_error(column, value):
+    """verify() promises a tampered database raises AuthStoreError.
+
+    Cost columns were validated but salt/verify_hash were not, so Argon2
+    raised TypeError/HashingError straight past a caller's
+    `except AuthStoreError` and became an unhandled 500.
+    """
+    path = _tmp_store_path()
+    store = UserStore(path)
+    store.add_user("dave", "dave-pw")
+    store._conn.execute(f"UPDATE users SET {column} = ? WHERE username = 'dave'",
+                        (value,))
+    store._conn.commit()
+
+    with pytest.raises(AuthStoreError):
+        store.verify("dave", "dave-pw")
+    store.close()
+
+
+def test_legacy_cost_row_is_not_separable_by_timing():
+    """A row still at legacy costs must not be distinguishable from an
+    unknown user in a single probe.
+
+    Pricing the level-up deficit in whole Argon2 *passes* could only land on
+    multiples of the ceiling's memory, so a row 2.875 passes short rounded up
+    to 3 and paid its own hash on top of a full ceiling hash — a stable ~6%
+    gap with no distribution overlap. The deficit is spent as memory instead,
+    which is granular to the KiB.
+    """
+    path = _tmp_store_path()
+    store = UserStore(path)
+    store.add_user("normal", "pw")
+    store.add_user("legacy", "pw")
+    store._conn.execute("UPDATE users SET time_cost = 1, memory_cost = 8192"
+                        " WHERE username = 'legacy'")
+    store._conn.commit()
+
+    def samples(user):
+        out = []
+        for _ in range(15):
+            t0 = time.perf_counter()
+            store.verify(user, "wrong-pw")
+            out.append(time.perf_counter() - t0)
+        return out
+
+    # Loose bound only — wall-clock on a shared machine is too noisy to
+    # assert a few percent. It still catches the regressions that mattered
+    # (the cheapest-row decoy was 7x, the stale cross-instance cache 11x).
+    unknown = statistics.median(samples("ghost"))
+    legacy = statistics.median(samples("legacy"))
+    ratio = max(legacy, unknown) / max(min(legacy, unknown), 1e-9)
+    assert ratio < 2.0, (
+        f"legacy-row timing tell: legacy={legacy*1000:.2f}ms "
+        f"unknown={unknown*1000:.2f}ms"
+    )
+    store.close()
+
+
+@pytest.mark.parametrize("row_costs", [
+    (1, 8192, ARGON2_PARALLELISM),        # oldest legacy row
+    (2, 32768, ARGON2_PARALLELISM),
+    (1, ARGON2_MEMORY_COST, ARGON2_PARALLELISM),
+    (2, ARGON2_MEMORY_COST, ARGON2_PARALLELISM),
+])
+def test_levelled_work_lands_on_the_ceiling(row_costs):
+    """The deterministic half of the timing property.
+
+    Total Argon2 work for a below-ceiling row must equal the ceiling, so
+    that "how long did this take" carries no information about which row
+    was hit. Asserted on the cost budget rather than the clock, because
+    that is what the padding actually controls.
+    """
+    ceiling = (ARGON2_TIME_COST, ARGON2_MEMORY_COST, ARGON2_PARALLELISM)
+    pad = _padding_costs(row_costs, ceiling)
+    own = row_costs[0] * row_costs[1]
+    total = own + (pad[0] * pad[1] if pad else 0)
+    budget = ceiling[0] * ceiling[1]
+
+    assert abs(total - budget) / budget < 0.005, (
+        f"row {row_costs[:2]} levels to {total}, ceiling is {budget}"
+    )
+
+
+def test_row_already_at_the_ceiling_is_not_padded():
+    """No wasted second hash in the common case."""
+    ceiling = (ARGON2_TIME_COST, ARGON2_MEMORY_COST, ARGON2_PARALLELISM)
+    assert _padding_costs(ceiling, ceiling) is None
+    assert _padding_costs((ARGON2_TIME_COST + 1, ARGON2_MEMORY_COST,
+                           ARGON2_PARALLELISM), ceiling) is None

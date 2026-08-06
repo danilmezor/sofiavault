@@ -168,6 +168,7 @@ class UserStore:
         self._fields_key = bytes(fields_key) if fields_key is not None else None
         self._fields_encrypted = self._fields_key is not None
         self._dummy_cost_cache: Optional[tuple[int, int, int]] = None
+        self._dummy_cost_version: Optional[int] = None
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         # Create at 0600 before sqlite opens it: a file created under the
         # umask is briefly world-readable, and an fd opened in that window
@@ -274,8 +275,16 @@ class UserStore:
 
         Cached because this is on the unknown-user path — the one an attacker
         drives — and invalidated by every write that can change the cost mix.
+
+        Our own writes clear the cache directly; `PRAGMA data_version` catches
+        everybody else's. Invalidating on our own writes alone is not enough:
+        each gunicorn/uwsgi worker holds its own UserStore, so a cost raised
+        by one worker would leave every other worker priced at a stale, lower
+        ceiling — which is exactly the "fast means does-not-exist" oracle this
+        ceiling exists to close.
         """
-        if self._dummy_cost_cache is None:
+        version = self._conn.execute("PRAGMA data_version").fetchone()[0]
+        if self._dummy_cost_cache is None or self._dummy_cost_version != version:
             t, m, p = ARGON2_TIME_COST, ARGON2_MEMORY_COST, ARGON2_PARALLELISM
             cur = self._conn.execute(
                 "SELECT DISTINCT time_cost, memory_cost, parallelism FROM users"
@@ -289,6 +298,7 @@ class UserStore:
                     continue
                 t, m, p = max(t, rt), max(m, rm), max(p, rp)
             self._dummy_cost_cache = (t, m, p)
+            self._dummy_cost_version = version
         return self._dummy_cost_cache
 
     # ── Hashing ──────────────────────────────────────────────────────────
@@ -567,7 +577,10 @@ class UserStore:
 
             costs = _validated_costs(row['time_cost'], row['memory_cost'],
                                      row['parallelism'])
-            computed = self._hash(password, row['salt'], *costs)
+            salt = _validated_blob(row['salt'], 'salt', SALT_SIZE)
+            stored_hash = _validated_blob(row['verify_hash'], 'verify_hash',
+                                          KEY_SIZE)
+            computed = self._hash(password, salt, *costs)
             # Pricing only the decoy at the ceiling does not close the
             # enumeration oracle, it inverts it: a user whose row is still at
             # legacy costs answers in 2ms where an unknown user costs 34ms, so
@@ -578,7 +591,7 @@ class UserStore:
             pad = _padding_costs(costs, self._dummy_costs())
             if pad is not None:
                 self._hash(password, self._dummy_salt, *pad)
-            if not hmac.compare_digest(computed, row['verify_hash']):
+            if not hmac.compare_digest(computed, stored_hash):
                 return None
 
             # Rehash only upward. Comparing `!=` to the defaults *lowered*
@@ -734,24 +747,54 @@ def _validated_costs(time_cost, memory_cost, parallelism) -> tuple[int, int, int
     return t, m, p
 
 
+def _validated_blob(value, column: str, size: int) -> bytes:
+    """Type/length-check a binary column read back out of a row.
+
+    SQLite's dynamic typing means `salt` can come back as TEXT or an INTEGER
+    once the file is writable, and Argon2 then raises TypeError/HashingError
+    straight past verify()'s "a tampered database raises AuthStoreError"
+    contract — a caller guarding `except AuthStoreError` gets an unhandled
+    500 instead of a clean failure.
+    """
+    if not isinstance(value, (bytes, bytearray)):
+        raise AuthStoreError(
+            f"stored {column} is {type(value).__name__}, not bytes"
+        )
+    if len(value) != size:
+        raise AuthStoreError(
+            f"stored {column} is {len(value)} bytes, expected {size}"
+        )
+    return bytes(value)
+
+
 def _padding_costs(costs: tuple[int, int, int],
                    ceiling: tuple[int, int, int]) -> Optional[tuple[int, int, int]]:
     """Extra Argon2 work that levels a below-ceiling row up to the ceiling.
 
     Argon2id's cost is essentially `time_cost` passes over `memory_cost`
-    bytes, so the deficit is priced in whole passes at the ceiling's memory:
-    the residual rounding error is at most half a pass, far below what a
-    remote attacker can separate from network noise. Returns None when the
-    row already pays ceiling cost — the common case, and no wasted work.
+    bytes. Spending the deficit as whole *passes* at the ceiling's memory —
+    the obvious reading — can only land on multiples of `ceil_m`: a legacy
+    row 2.875 passes short rounds up to 3, so it pays its own hash on top of
+    a full ceiling hash and answers a measurable ~6% slower than an unknown
+    user. That is a stable, non-overlapping tell for "this account exists on
+    a legacy row", and it never expires, because the upward rehash only fires
+    on a *successful* login and an attacker probes with wrong passwords.
+
+    `memory_cost` is granular to the KiB, so the same budget is spent as
+    `ceil_t` passes over whatever memory that works out to, and the total
+    lands within noise of the ceiling. Returns None when the row already
+    pays ceiling cost — the common case, and no wasted work.
     """
     ceil_t, ceil_m, ceil_p = ceiling
     deficit = ceil_t * ceil_m - costs[0] * costs[1]
     if deficit <= 0:
         return None
-    passes = int(round(deficit / ceil_m))
-    if passes < 1:
+    memory = deficit // ceil_t
+    # Argon2 requires at least 8 KiB per lane; a deficit below that is
+    # already too small to be worth a second hash.
+    if memory < 8 * ceil_p:
         return None
-    return (min(passes, _MAX_TIME_COST), ceil_m, ceil_p)
+    return (ceil_t, min(memory, _MAX_MEMORY_COST), ceil_p)
 
 
 def _is_truthy_active(value) -> bool:

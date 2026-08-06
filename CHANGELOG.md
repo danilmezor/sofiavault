@@ -99,9 +99,18 @@ plaintext `.env` files full of secrets, injected wholesale into containers.
   unknown ones at 7x; pricing it from the ceiling alone merely inverted the
   tell. Measured spread across unknown / inactive / wrong-password /
   legacy-row accounts is now ~1.1x.
-- **Stored Argon2 parameters are validated on read**, so a tampered row
-  cannot wedge or OOM verification with an absurd `memory_cost`, and a
-  successful login never *lowers* cost parameters an operator raised.
+  The ceiling is recomputed whenever another connection commits
+  (`PRAGMA data_version`), not only on this instance's own writes — each
+  worker process holds its own `UserStore`, so a cost raised by one worker
+  would otherwise leave the others priced at a stale, lower ceiling.
+  The level-up deficit is spent as `memory_cost` rather than whole Argon2
+  passes, which lands on the ceiling instead of overshooting it and
+  leaving legacy rows separable.
+- **Stored Argon2 parameters and binary columns are validated on read**,
+  so a tampered row cannot wedge or OOM verification with an absurd
+  `memory_cost`, cannot raise `TypeError` past the store's own error type
+  with a non-`bytes` `salt` or `verify_hash`, and a successful login never
+  *lowers* cost parameters an operator raised.
 - **Encrypted profile fields cannot be downgraded to plaintext.** The
   store records whether it encrypts fields; a row presenting plaintext in
   an encrypting store is refused. Previously, setting `fields_enc` to NULL
