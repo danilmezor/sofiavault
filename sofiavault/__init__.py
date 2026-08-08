@@ -8,7 +8,9 @@ Library entry points:
 
 Importing this package is silent: no prompts, no prints, no network.
 The flat re-exports below keep the historical single-module surface
-(`from sofiavault import derive_key, init_db, ...`) working.
+(`from sofiavault import derive_key, init_db, ...`) working, with one
+deliberate exception: delete_entry now requires the master key so the
+entry-set MAC is re-signed instead of stripped (see CHANGELOG, 0.3.0).
 """
 
 __version__ = "0.3.0"
@@ -27,6 +29,8 @@ __all__ = [
     "normalize_username",
     # env
     "envload", "paths",
+    # 0.2.x compatibility aliases for the CLI's default locations
+    "DB_PATH", "HISTORY_PATH",
     # generator
     "generate_password", "GEN_CHARSET", "GEN_DEFAULT_LENGTH",
     # crypto primitives
@@ -35,6 +39,18 @@ __all__ = [
     # cli entry point
     "main",
 ]
+
+# ── 0.2.x compatibility: sofiavault.DB_PATH / sofiavault.HISTORY_PATH ────────
+# The historical single-module surface exposed these as assignable globals
+# ("sofiavault.DB_PATH = tmp" pointed every command at a sandbox vault).
+# They now live in sofiavault.paths, and all vault-location code reads
+# paths.* — a plain re-export here would make that assignment a dead
+# attribute nothing reads, silently retargeting commands at the real
+# ~/.sofiavault vault. These forwarding properties keep both reads and
+# writes hitting paths.*, so the old pattern keeps working.
+import sys as _sys
+import types as _types
+from pathlib import Path as _Path
 
 from . import envload, paths  # noqa: F401  (isort: after siblings to avoid cycle)
 from .auth import (  # noqa: F401
@@ -127,3 +143,31 @@ from .vault import (  # noqa: F401
     VaultNotInitialized,
     WrongPassword,
 )
+
+
+class _CompatModule(_types.ModuleType):
+    @property
+    def DB_PATH(self) -> _Path:
+        return paths.DB_PATH
+
+    @DB_PATH.setter
+    def DB_PATH(self, value):
+        paths.DB_PATH = _Path(value)
+
+    @property
+    def HISTORY_PATH(self) -> _Path:
+        return paths.HISTORY_PATH
+
+    @HISTORY_PATH.setter
+    def HISTORY_PATH(self, value):
+        paths.HISTORY_PATH = _Path(value)
+
+
+_sys.modules[__name__].__class__ = _CompatModule
+
+# Seed inert module-__dict__ entries so unittest.mock.patch("sofiavault.DB_PATH")
+# sees the attribute as local and restores the original on exit. Reads and
+# writes never touch these: the properties above are data descriptors, which
+# take precedence over the instance __dict__.
+_sys.modules[__name__].__dict__["DB_PATH"] = paths.DB_PATH
+_sys.modules[__name__].__dict__["HISTORY_PATH"] = paths.HISTORY_PATH

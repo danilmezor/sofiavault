@@ -251,11 +251,7 @@ class Vault:
         """
         with self._lock:
             self._require_unlocked()
-            if self.tampered:
-                raise VaultCorrupted(
-                    "the set of entries does not match its authentication tag — "
-                    "a secret may have been rolled back, added, or removed"
-                )
+            self._require_untampered()
             meta = get_entry_by_service(self._entries, service)
             if meta is None:
                 if self.corrupt_count:
@@ -280,9 +276,15 @@ class Vault:
 
     def set(self, service: str, password: str, username: str = '',
             url: str = '') -> int:
-        """Add or update an entry. Returns its row id."""
+        """Add or update an entry. Returns its row id.
+
+        Refuses on a tampered vault: every write re-signs the current row
+        set, so writing here would launder a detected rollback, insertion,
+        or deletion into a fresh valid MAC.
+        """
         with self._lock:
             self._require_unlocked()
+            self._require_untampered()
             existing = get_entry_by_service(self._entries, service)
             if existing is None:
                 row_id = save_entry(self._conn, self._key, service, username,
@@ -296,9 +298,13 @@ class Vault:
             return row_id
 
     def delete(self, service: str):
-        """Delete an entry. Raises EntryNotFound if absent."""
+        """Delete an entry. Raises EntryNotFound if absent.
+
+        Refuses on a tampered vault, for the same reason as set().
+        """
         with self._lock:
             self._require_unlocked()
+            self._require_untampered()
             meta = get_entry_by_service(self._entries, service)
             if meta is None:
                 raise EntryNotFound(service)
@@ -353,6 +359,13 @@ class Vault:
     def _require_unlocked(self):
         if self._key is None:
             raise VaultLocked("vault is closed")
+
+    def _require_untampered(self):
+        if self.tampered:
+            raise VaultCorrupted(
+                "the set of entries does not match its authentication tag — "
+                "a secret may have been rolled back, added, or removed"
+            )
 
 
 def _decode_key(value: str, source: str) -> bytes:

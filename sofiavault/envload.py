@@ -349,8 +349,14 @@ def _iter_env_pairs(text: str):
         value = value.strip()
         if value[:1] in ('"', "'"):
             quote = value[0]
-            if len(value) >= 2 and value[-1] == quote:
-                yield name, value[1:-1]
+            end = value.find(quote, 1)
+            if end != -1:
+                # Closed on its own line. Only whitespace or a comment may
+                # follow the closing quote — anything else is ambiguous, and
+                # guessing here silently swallows whatever comes next.
+                rest = value[end + 1:].strip()
+                yield name, (value[1:end] if not rest or rest.startswith('#')
+                             else None)
                 continue
             parts = [value[1:]]
             closed = False
@@ -402,9 +408,10 @@ def import_env_file(vault: Vault, env_path: Union[str, Path],
     for name, value in pairs:
         if value is None:
             raise MalformedEnvFile(
-                f"{env_path}: the value of {name} opens a quote that is never "
-                "closed, so everything after it is ambiguous. Nothing was "
-                "imported — fix the quoting and re-run."
+                f"{env_path}: the value of {name} has broken quoting (an "
+                "unclosed quote, or content after the closing quote), so "
+                "everything after it is ambiguous. Nothing was imported — "
+                "fix the quoting and re-run."
             )
 
     for name, value in pairs:

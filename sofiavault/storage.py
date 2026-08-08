@@ -101,14 +101,26 @@ def init_db(db_path: Optional[Path] = None,
         )
     """)
     conn.execute("CREATE TABLE IF NOT EXISTS vault_meta (key TEXT PRIMARY KEY, value TEXT)")
-    # A brand-new database starts at the current schema version; existing
-    # ones keep theirs until migrate_* upgrades them.
-    if conn.execute("SELECT COUNT(*) FROM entries_v2").fetchone()[0] == 0 and \
-            conn.execute(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='entries'"
-            ).fetchone()[0] == 0:
+    # A brand-new database starts at the current schema version. "Brand new"
+    # must mean no master record either: an initialized 0.2.x vault that
+    # happens to hold zero entries is still an existing vault, and stamping
+    # it v3 here would skip migrate_v2_to_v3's MAC adoption — leaving a v3
+    # vault with no entries MAC, which verify_entries_mac rightly treats as
+    # stripped tamper evidence. Existing vaults keep their recorded version,
+    # or fall back to '2' so the migration path adopts them.
+    brand_new = (
         conn.execute(
-            "INSERT OR REPLACE INTO vault_meta (key, value) VALUES ('schema_version', ?)",
+            "SELECT value FROM vault_meta WHERE key = 'schema_version'"
+        ).fetchone() is None
+        and conn.execute("SELECT COUNT(*) FROM master").fetchone()[0] == 0
+        and conn.execute("SELECT COUNT(*) FROM entries_v2").fetchone()[0] == 0
+        and conn.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='entries'"
+        ).fetchone()[0] == 0
+    )
+    if brand_new:
+        conn.execute(
+            "INSERT INTO vault_meta (key, value) VALUES ('schema_version', ?)",
             (str(SCHEMA_VERSION),)
         )
     else:

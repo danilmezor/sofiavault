@@ -49,6 +49,7 @@ from .storage import (
     save_entry,
     save_master,
     update_entry,
+    verify_entries_mac,
 )
 from .vault import (
     Vault,
@@ -88,7 +89,9 @@ SYM_DASH = "—"
 
 class C:
     """ANSI color codes. Disabled automatically if output is not a TTY."""
-    _enabled = sys.stdout.isatty()
+    # sys.stdout is None under pythonw/detached daemons, and this runs at
+    # import time — `import sofiavault` must survive it.
+    _enabled = sys.stdout is not None and sys.stdout.isatty()
 
     RESET = "\033[0m"
     BOLD = "\033[1m"
@@ -216,15 +219,29 @@ def schedule_clipboard_clear(secret: str, delay: int = CLIPBOARD_CLEAR_SECONDS) 
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _repo_dir() -> Optional[Path]:
-    """Return the git clone this package runs from, or None (pip installs etc.)."""
+    """Return the git clone this package runs from, or None (pip installs etc.).
+
+    Only the exact repo layout counts: <root>/sofiavault/cli.py with
+    <root>/.git and <root>/pyproject.toml naming this project. Scanning
+    further up would match whatever unrelated repo happens to enclose an
+    extracted tarball — and the update check runs `git pull` in its result.
+    """
     try:
         here = Path(__file__).resolve()
     except OSError:
         return None
-    for parent in list(here.parents)[:3]:
-        if (parent / '.git').exists():
-            return parent
-    return None
+    if len(here.parents) < 2:
+        return None
+    repo = here.parents[1]
+    if not (repo / '.git').exists():
+        return None
+    try:
+        pyproject = (repo / 'pyproject.toml').read_text(encoding='utf-8')
+    except OSError:
+        return None
+    if 'name = "sofiavault"' not in pyproject:
+        return None
+    return repo
 
 
 def _git(repo: Path, *args: str, timeout: int = UPDATE_FETCH_TIMEOUT):
@@ -681,13 +698,23 @@ def cmd_import_vault(src: str) -> bool:
 
 
 def _wipe_targets() -> list[Path]:
-    """The explicit allowlist of files a wipe may touch — nothing else."""
+    """The explicit allowlist of files a wipe may touch — nothing else.
+
+    Derived from paths.DB_PATH (not hardcoded) so tests that patch it stay
+    sandboxed. Includes the auth store `auth import` creates next to the
+    vault: wipe promises every stored credential artifact is destroyed,
+    and its Argon2 verifiers are exactly that.
+    """
+    users_db = paths.DB_PATH.parent / 'users.db'
     return [
         paths.DB_PATH,
         Path(str(paths.DB_PATH) + "-wal"),
         Path(str(paths.DB_PATH) + "-journal"),
         paths.DB_PATH.with_name(paths.DB_PATH.name + ".v1-backup"),
         paths.DB_PATH.with_name(paths.DB_PATH.name + ".replaced-backup"),
+        users_db,
+        Path(str(users_db) + "-wal"),
+        Path(str(users_db) + "-journal"),
         paths.HISTORY_PATH,
     ]
 
@@ -746,6 +773,7 @@ class VaultSession:
         self.key = key
         self.entries: list[VaultEntry] = []
         self.corrupt_count = 0
+        self.tampered = False
         self.last_activity = time.time()
         if key is not None:
             self.reload()
@@ -753,6 +781,10 @@ class VaultSession:
     def reload(self):
         """Rebuild the decrypted metadata index from the database."""
         self.entries, self.corrupt_count = load_entries(self.conn, self.key)
+        # Same entry-set check the library enforces: detects whole-blob
+        # rollback, row insertion, and row deletion, which per-entry
+        # authentication cannot see.
+        self.tampered = not verify_entries_mac(self.conn, self.key)
 
     def lock(self):
         """Drop the key and all decrypted data from memory."""
@@ -860,7 +892,6 @@ def cmd_add(session: VaultSession):
         if confirm != 'y':
             print_info("Cancelled.")
             return
-        delete_entry(session.conn, existing.id, session.key)
 
     username = input(f"  {style('Username/Email', C.DIM)}: ").strip()
     if not username:
@@ -872,7 +903,15 @@ def cmd_add(session: VaultSession):
         print_error("Password required.")
         return
 
-    save_entry(session.conn, session.key, service, username, password)
+    # Only replace the existing entry once the replacement is fully
+    # collected — an abort above must leave the old entry untouched.
+    if existing:
+        payload = _load_entry_payload(session.conn, session.key, existing.id) or {}
+        update_entry(session.conn, session.key, existing.id, service, username,
+                     payload.get('url', ''), password,
+                     payload.get('created_at', ''))
+    else:
+        save_entry(session.conn, session.key, service, username, password)
     session.reload()
     print()
     print_success(f"Saved {style(service, C.CYAN)} for {username}")
@@ -1520,6 +1559,8 @@ class VaultREPL(cmd.Cmd):
         if key is None:
             return False
         self.session.unlock_with(key)
+        # The vault file may have been modified while the session sat locked.
+        _refuse_if_tampered(self.session)
         return True
 
     def precmd(self, line: str) -> str:
@@ -1710,6 +1751,30 @@ def _warn_corrupt(session: VaultSession):
         print_warn(f"{session.corrupt_count} entries could not be decrypted.")
 
 
+def _refuse_if_tampered(session: VaultSession):
+    """Fail closed when the entry-set MAC does not verify.
+
+    The CLI must neither hand out nor re-sign secrets from a vault whose
+    row set no longer matches its authentication tag — that mismatch is
+    exactly the rollback/insertion/deletion evidence the MAC exists to
+    surface, and the library (Vault, envload) already refuses it.
+    """
+    if not session.tampered:
+        return
+    print()
+    print_error("TAMPERING DETECTED: this vault's entries do not match their")
+    print_error("authentication tag. A secret may have been rolled back, added,")
+    print_error("or removed by someone with write access to the vault file.")
+    print()
+    print_info("No secrets were revealed or written. If you have a trusted")
+    print_info(f"backup, restore it over {paths.DB_PATH} and try again.")
+    print_info("To destroy the vault anyway, delete the files under "
+               f"{paths.DB_PATH.parent} manually.")
+    print()
+    session.lock()
+    sys.exit(1)
+
+
 def _run_oneshot(args: list[str]):
     """Run a single command and exit (backward-compatible mode)."""
     command = args[0].lower()
@@ -1733,6 +1798,7 @@ def _run_oneshot(args: list[str]):
 
     conn, key = _open_vault(show_banner_on_setup=True)
     session = VaultSession(conn, key)
+    _refuse_if_tampered(session)
     _warn_corrupt(session)
 
     if command == 'add':
@@ -1780,6 +1846,7 @@ def _run_repl():
     print_banner()
     conn, key = _open_vault(show_banner_on_setup=False)
     session = VaultSession(conn, key)
+    _refuse_if_tampered(session)
 
     print_success(f"Vault unlocked  "
                   f"{style(f'({len(session.entries)} entries)', C.DIM)}")

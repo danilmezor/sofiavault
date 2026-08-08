@@ -131,7 +131,13 @@ plaintext `.env` files full of secrets, injected wholesale into containers.
 ### Changed
 - The single-file module is now a package (`core`, `storage`, `vault`,
   `auth`, `envload`, `generator`, `cli`) with the historical flat import
-  surface preserved (`from sofiavault import derive_key, ...`).
+  surface preserved (`from sofiavault import derive_key, ...`), including
+  the assignable `sofiavault.DB_PATH` / `sofiavault.HISTORY_PATH`
+  overrides (they forward to `sofiavault.paths`).
+- **Breaking**: `delete_entry(conn, entry_id)` is now
+  `delete_entry(conn, entry_id, key)`. The keyless form cleared the
+  entry-set MAC — a one-line tamper-evidence strip — so it was removed
+  deliberately rather than kept for compatibility.
 - `Vault` and `UserStore` serialize access internally, so a single
   instance can be shared by a threaded server.
 - `envload.load()` returns `(injected, skipped)` and
