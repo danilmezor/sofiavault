@@ -660,6 +660,56 @@ def test_h6_row_deletion_plus_version_rollback_is_detected():
     v.close()
 
 
+def test_h6_rollback_plus_mac_delete_plus_version_rollback_is_detected():
+    """Removing BOTH unauthenticated signals at once.
+
+    The schema-rollback defence only bails when a MAC row is present, and the
+    'v3 implies a MAC' defence only fires while schema_version reads >= 3. An
+    attacker who deletes the entries_mac row AND rolls schema_version to '2'
+    defeats one guard with the other: migrate_v2_to_v3 re-entered with no MAC
+    to compare against used to re-sign the tampered rows over a fresh MAC. The
+    entry blobs themselves (still authenticated under the v3 AAD) are the
+    witness the metadata is not.
+    """
+    path, old = _rollback_fixture()
+    conn = sqlite3.connect(str(path))
+    conn.execute("UPDATE entries_v2 SET salt=?, nonce=?, blob=? WHERE id=1", old)
+    conn.execute("DELETE FROM vault_meta WHERE key='entries_mac'")
+    conn.execute("UPDATE vault_meta SET value='2' WHERE key='schema_version'")
+    conn.commit()
+    conn.close()
+
+    v = Vault.open(path, password=PW)
+    assert v.tampered
+    with pytest.raises(VaultCorrupted):
+        v.get("stripe-api")          # must not hand back the leaked old key
+    v.close()
+
+    # The real schema_version is restored and the tampered set is never
+    # re-signed, so a second open reaches the same verdict.
+    assert get_schema_version(Vault.open(path, password=PW)._conn) == 3
+    v = Vault.open(path, password=PW)
+    assert v.tampered
+    v.close()
+
+
+def test_h6_row_deletion_plus_mac_delete_plus_version_rollback_is_detected():
+    v, path = _vault()
+    v.set("stripe-api", "sk_live_X")
+    v.set("db-pass", "hunter2")
+    v.close()
+    conn = sqlite3.connect(str(path))
+    conn.execute("DELETE FROM entries_v2 WHERE id=1")
+    conn.execute("DELETE FROM vault_meta WHERE key='entries_mac'")
+    conn.execute("UPDATE vault_meta SET value='2' WHERE key='schema_version'")
+    conn.commit()
+    conn.close()
+
+    v = Vault.open(path, password=PW)
+    assert v.tampered, "a deleted row must not be laundered by stripping both signals"
+    v.close()
+
+
 def test_h6_new_vault_carries_a_mac_before_any_entry_is_written():
     """Without this, 'v3 implies a MAC exists' is false for empty vaults and
     an attacker could wipe every entry plus the MAC and look untampered."""

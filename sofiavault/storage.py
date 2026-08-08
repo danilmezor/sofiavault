@@ -512,6 +512,33 @@ def migrate_v2_to_v3(conn: sqlite3.Connection, key: bytes) -> int:
 
     vault_id = _ensure_vault_id(conn)
     rows = conn.execute("SELECT id, salt, nonce, blob FROM entries_v2").fetchall()
+
+    # The MAC check above only fires when a MAC is *present*. entries_mac and
+    # schema_version are both unauthenticated text, so an attacker with
+    # file-write access can delete the MAC row and roll schema_version back to
+    # '2' together: no MAC to fail the check, yet this path would migrate and
+    # re-sign whatever the rows now hold — laundering a rolled-back, deleted, or
+    # shadow-inserted row set into a fresh, valid MAC.
+    #
+    # The rows themselves are the authenticated witness the metadata is not. A
+    # genuine v2 blob authenticates only under the constant ENTRY_CONTEXT AAD; a
+    # v3 blob authenticates under _entry_aad(vault_id, row_id). If any row still
+    # decrypts as v3, this "v2" vault is a rolled-back v3 one. Restore the true
+    # schema_version and refuse to migrate or re-sign, leaving verify_entries_mac
+    # to judge the rows against the real schema and the (possibly stripped) MAC.
+    for row_id, salt, nonce, blob in rows:
+        try:
+            decrypt(nonce, blob, derive_entry_key(key, salt),
+                    aad=_entry_aad(vault_id, row_id))
+        except Exception:
+            continue
+        conn.execute(
+            "INSERT OR REPLACE INTO vault_meta (key, value) VALUES ('schema_version', ?)",
+            (str(SCHEMA_VERSION),)
+        )
+        conn.commit()
+        return 0
+
     upgraded = 0
     try:
         for row_id, salt, nonce, blob in rows:
