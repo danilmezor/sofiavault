@@ -181,7 +181,13 @@ def _entries_mac(conn: sqlite3.Connection, key: bytes) -> bytes:
     mac_key = derive_entry_key(key, b"sofiavault-entries-mac-salt")
     h = hmac.new(mac_key, b"sofiavault-entries-v3", hashlib.sha256)
     h.update(b"schema=%d;" % get_schema_version(conn))
-    h.update(b"vault=%s;" % _read_vault_id(conn).encode('ascii'))
+    # UTF-8, not ASCII: a genuine vault_id is hex (identical under both), but a
+    # file-writer can drop non-ASCII text into this column. Encoding it as ASCII
+    # raised UnicodeEncodeError straight out of the read-only verify path —
+    # bypassing the "tampering surfaces as tampered=True" contract with a raw
+    # crash. UTF-8 folds any such value into the digest instead, so a changed
+    # vault_id simply fails the MAC like every other edit to it.
+    h.update(b"vault=%s;" % _read_vault_id(conn).encode('utf-8'))
     for row_id, nonce in conn.execute(
             "SELECT id, nonce FROM entries_v2 ORDER BY id"):
         h.update(b"%d:" % row_id)
@@ -233,7 +239,7 @@ def _entry_aad(vault_id: str, row_id: int) -> bytes:
     rollback of a rotated secret, duplicate-row shadowing, and cross-vault
     transplant. All three are authenticated-decryption failures now.
     """
-    return b"%s|%s|%d" % (ENTRY_CONTEXT, vault_id.encode('ascii'), row_id)
+    return b"%s|%s|%d" % (ENTRY_CONTEXT, vault_id.encode('utf-8'), row_id)
 
 
 def is_vault_initialized(conn: sqlite3.Connection) -> bool:

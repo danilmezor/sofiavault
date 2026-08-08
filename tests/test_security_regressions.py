@@ -16,7 +16,13 @@ import pytest
 from cryptography.exceptions import InvalidTag
 
 from sofiavault import KEY_SIZE, envload
-from sofiavault.auth import InvalidUsername, UserStore, normalize_username
+from sofiavault.auth import (
+    AuthStoreError,
+    InvalidUsername,
+    UserStore,
+    _validated_costs,
+    normalize_username,
+)
 from sofiavault.core import ARGON2_MEMORY_COST, ARGON2_TIME_COST
 from sofiavault.envload import UnsafeVariableName, is_safe_name
 from sofiavault.storage import get_schema_version
@@ -964,3 +970,55 @@ def test_h8_trailing_newline_does_not_evade_the_denylist():
     VALID_NAME and then missed the UNSAFE_NAMES lookup."""
     assert is_safe_name("PATH\n") is False
     assert is_safe_name("BASH_ENV\n") is False
+
+
+# ── Review findings 2-4: contract/robustness hardening ───────────────────────
+
+def test_finding2_non_ascii_vault_id_surfaces_as_tampering_not_a_crash():
+    """A file-writer setting vault_id to non-ASCII text used to raise a raw
+    UnicodeEncodeError out of Vault.open (vault_id feeds the entry-set MAC via
+    an ASCII encode). It must instead be caught as tampering and fail closed,
+    honoring the "every failure is a typed VaultError" contract."""
+    v, path = _vault()
+    v.set("svc", "secret")
+    v.close()
+
+    conn = sqlite3.connect(str(path))
+    conn.execute("UPDATE vault_meta SET value=? WHERE key='vault_id'", ("idéx",))
+    conn.commit()
+    conn.close()
+
+    v2 = Vault.open(path, password=PW)      # no raw exception escapes
+    assert v2.tampered is True              # a changed vault_id breaks the MAC
+    assert v2.corrupt_count == 1            # ...and the AAD, so the blob won't decrypt
+    with pytest.raises(VaultCorrupted):     # fails closed, no stale secret
+        v2.get("svc")
+    v2.close()
+
+
+def test_finding3_non_serializable_fields_raise_typed_error():
+    """add_user/update_fields handed a non-JSON value (set, bytes) used to
+    raise a raw TypeError from json.dumps; it must be the store's typed
+    AuthStoreError so callers guarding the store API surface still catch it."""
+    store = UserStore(_store())
+    for value in ({1, 2, 3}, b"bytes"):
+        with pytest.raises(AuthStoreError):
+            store.add_user("alice", "alice-pw", data=value)
+    assert store.add_user("bob", "bob-pw", role="admin") is True   # normal fields ok
+    with pytest.raises(AuthStoreError):
+        store.update_fields("bob", data={9})
+    store.close()
+
+
+def test_finding4_abusive_time_and_parallelism_costs_are_rejected():
+    """The trusted cost ceilings bound a tampered row's blast radius: because
+    _dummy_costs() prices every unknown-user probe at the most expensive row,
+    a wide ceiling turns one row into a store-wide login DoS. Library defaults
+    and sane operator values still validate; interactive-implausible costs do
+    not."""
+    _validated_costs(ARGON2_TIME_COST, ARGON2_MEMORY_COST, 4)   # defaults accepted
+    _validated_costs(10, 1 << 20, 8)                            # generous but sane
+    with pytest.raises(AuthStoreError):
+        _validated_costs(32, 1 << 20, 4)                        # abusive time_cost
+    with pytest.raises(AuthStoreError):
+        _validated_costs(3, 65536, 64)                          # abusive parallelism

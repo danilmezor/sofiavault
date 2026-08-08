@@ -65,9 +65,18 @@ _RAW_LENGTH_FACTOR = 8
 #: dynamically typed and the file is only as trustworthy as its permissions:
 #: a single UPDATE setting memory_cost to 1 TiB turns every verify() into an
 #: out-of-memory kill, and a value below the floor is a cracking discount.
-_MAX_TIME_COST = 32
+#:
+#: The ceilings are also the blast radius of a tampered row, not just its own
+#: cost: _dummy_costs() prices every unknown-user probe at the most expensive
+#: row in the store, so one row at the maximum makes *every* login attempt pay
+#: it. time_cost and parallelism have no interactive-auth reason to reach the
+#: old 32/64 — a value that high is tampering, not tuning — so they are held to
+#: values that still clear any sane operator config (defaults are 3/4) while
+#: keeping the amplified worst case bounded. memory stays at 1 GiB, a defensible
+#: high-security ceiling.
+_MAX_TIME_COST = 12
 _MAX_MEMORY_COST = 1 << 20  # KiB, i.e. 1 GiB
-_MAX_PARALLELISM = 64
+_MAX_PARALLELISM = 16
 
 #: Shortest possible fields_enc blob: nonce + GCM tag. Anything shorter is
 #: truncated, and slicing it would reach AESGCM with a stub nonce, which
@@ -342,7 +351,15 @@ class UserStore:
             raise AuthStoreError(
                 "this store encrypts profile fields; construct UserStore with fields_key"
             )
-        payload = json.dumps(fields, ensure_ascii=False)
+        try:
+            payload = json.dumps(fields, ensure_ascii=False)
+        except (TypeError, ValueError) as exc:
+            # A caller handing add_user/update_fields a set, bytes, or other
+            # non-JSON value should get the store's typed error, not a raw
+            # TypeError from deep inside the encoder.
+            raise AuthStoreError(
+                f"profile fields are not JSON-serializable: {exc}"
+            ) from exc
         if self._fields_key is None:
             return payload, None
         nonce = secrets.token_bytes(NONCE_SIZE)

@@ -160,9 +160,21 @@ class Vault:
             conn.close()
             raise VaultCorrupted(f"master record is unreadable: {exc}") from exc
 
-        migration = migrate_legacy_vault(conn, master_key, path)
-        migrate_v2_to_v3(conn, master_key)
-        return cls(conn, master_key, path, migration=migration)
+        # Migration and the first index load read attacker-influenced metadata
+        # (vault_id, schema_version, entry blobs). The contract is that every
+        # failure here is a typed VaultError with the connection closed — a raw
+        # library exception escaping open() would leave a live fd on a file we
+        # already distrust.
+        try:
+            migration = migrate_legacy_vault(conn, master_key, path)
+            migrate_v2_to_v3(conn, master_key)
+            return cls(conn, master_key, path, migration=migration)
+        except VaultError:
+            conn.close()
+            raise
+        except Exception as exc:
+            conn.close()
+            raise VaultCorrupted(f"vault metadata is unreadable: {exc}") from exc
 
     @classmethod
     def open_auto(cls, path: Union[str, Path],
