@@ -462,6 +462,18 @@ def test_m5_cyrillic_lookalike_stays_distinct():
     assert normalize_username("аdmin") != normalize_username("admin")
 
 
+@pytest.mark.parametrize("sep", [" ", " "])
+def test_m5_unicode_line_separators_rejected(sep):
+    # U+2028/U+2029 are category Zl/Zp, not Cc/Cf, so they slipped past the
+    # control-character screen — yet str.splitlines() (and JS, and log
+    # viewers) treat them as newlines, smuggling the same forged second log
+    # record that rejecting '\n' is meant to prevent.
+    payload = "alice" + sep + "auth.success user=admin"
+    assert len(payload.splitlines()) == 2   # it really does break lines
+    with pytest.raises(InvalidUsername):
+        normalize_username(payload)
+
+
 def test_l11_verify_never_raises_on_bad_input_types():
     path = _store()
     store = UserStore(path)

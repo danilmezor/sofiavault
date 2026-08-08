@@ -50,7 +50,11 @@ AUTH_CONTEXT = b"sofiavault-auth-v1"
 #: Characters that must never appear in a username: C0/C1 controls, NUL,
 #: bidi/zero-width marks, and other format characters. They enable log
 #: forging, C-string truncation, and visually identical shadow accounts.
-_FORBIDDEN_CATEGORIES = {'Cc', 'Cf', 'Co', 'Cs', 'Cn'}
+#: Zl/Zp are the Unicode line/paragraph separators (U+2028/U+2029): not
+#: control or format characters, but str.splitlines(), JSON-in-JS, and many
+#: log viewers treat them as newlines, so they smuggle exactly the log-forged
+#: second record that rejecting '\n' (a Cc control) is meant to prevent.
+_FORBIDDEN_CATEGORIES = {'Cc', 'Cf', 'Co', 'Cs', 'Cn', 'Zl', 'Zp'}
 
 #: How much longer than `max_length` a raw username may be before it is
 #: rejected unnormalized. NFKC can expand (U+FDFA alone becomes 18 characters)
