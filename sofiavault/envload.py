@@ -318,24 +318,41 @@ def load(path: Union[str, Path, None] = None, *, vault: Optional[Vault] = None,
     return sorted(injected), sorted(skipped)
 
 
-def _closing_quote(text: str, quote: str, first: int) -> int:
-    """Index of the quote that closes a quoted value, or -1 if none does.
+#: `_closing_quote` outcomes other than an index.
+_NO_CLOSE = -1      # no quote on this line could close the value
+_AMBIGUOUS = -2     # a quote closes, but unexplained text follows it
 
-    A value closes at the last quote followed by nothing but whitespace or
-    a `#` comment. Scanning from the right keeps values that merely
-    *contain* the quote character working — PASS='it's-secret',
-    WIN_DIR='C:\\tools\\' — exactly as they always have; understanding a
-    trailing comment is the only behaviour this adds. No escape sequences
-    are interpreted, so nothing has to be unescaped on the way out.
+
+def _closing_quote(text: str, quote: str, first: int) -> int:
+    """Where a quoted value closes: an index, `_NO_CLOSE`, or `_AMBIGUOUS`.
+
+    A value closes at the *first* quote followed by nothing but whitespace
+    or a `#` comment. Taking the first such quote is what strips a trailing
+    comment correctly even when the comment itself contains quotes
+    (`PW="hunter2" # rotate with the "primary"`); continuing past quotes
+    that fail the test is what keeps values merely *containing* the quote
+    character working (`PASS='it's-secret'`, `WIN_DIR='C:\\tools\\'`).
+
+    No escape sequences are interpreted — nothing has to be unescaped on
+    the way out, and a backslash means only itself.
+
+    `_AMBIGUOUS` is reported when some quote could have closed the value
+    but is followed by text that is neither whitespace nor a comment
+    (`FOO="bar" baz`). The caller must not guess: treating that as an
+    unterminated multi-line value silently swallows the following lines,
+    secrets and all.
     """
-    end = len(text)
+    candidate = False
+    i = first
     while True:
-        end = text.rfind(quote, first, end)
-        if end == -1:
-            return -1
-        rest = text[end + 1:].strip()
+        i = text.find(quote, i)
+        if i == -1:
+            return _AMBIGUOUS if candidate else _NO_CLOSE
+        rest = text[i + 1:].strip()
         if not rest or rest.startswith('#'):
-            return end
+            return i
+        candidate = True
+        i += 1
 
 
 def _iter_env_pairs(text: str):
@@ -351,6 +368,16 @@ def _iter_env_pairs(text: str):
 
     the middle line reads as key material to a reviewer, but becomes its
     own injected variable.
+
+    Limit worth knowing, because the format cannot express otherwise: with
+    no escape sequences, a multi-line value ends at the first following
+    line whose quote is not followed by other text. A line *inside* the
+    value that happens to end in the quote character therefore closes it
+    early, and lines after that are read as ordinary entries — the same
+    smuggling shape, reachable by anyone who can write the `.env`. Treat a
+    `.env` as untrusted input: `load(allow=[...])` bounds what may ever be
+    injected regardless of how the file parses, and is the only gate that
+    does not have to anticipate the attacker's choice of name.
     """
     lines = text.splitlines()
     i = 0
@@ -370,21 +397,28 @@ def _iter_env_pairs(text: str):
         if value[:1] in ('"', "'"):
             quote = value[0]
             end = _closing_quote(value, quote, 1)
-            if end != -1:
+            if end == _AMBIGUOUS:
+                # Reject the line rather than read it as an unterminated
+                # multi-line value: doing the latter swallows every
+                # following line, so the secrets they define are never
+                # imported and end up buried inside this value instead.
+                yield name, None
+                continue
+            if end != _NO_CLOSE:
                 yield name, value[1:end]
                 continue
-            # Does not close on its own line: consume following lines until
-            # one does. A line that never closes leaves the value None, and
-            # import_env_file then imports nothing at all — the point is that
-            # ambiguous quoting can never silently turn a line of key
-            # material into its own injected variable.
+            # Genuinely unterminated: consume following lines until one
+            # closes. A value that never closes stays None, and
+            # import_env_file then imports nothing at all.
             parts = [value[1:]]
             closed = False
             while i < len(lines):
                 nxt = lines[i]
                 i += 1
                 end = _closing_quote(nxt, quote, 0)
-                if end == -1:
+                if end < 0:
+                    # Ambiguity inside a multi-line value is content, not a
+                    # close — a stray quote in a PEM comment must not end it.
                     parts.append(nxt)
                     continue
                 parts.append(nxt[:end])

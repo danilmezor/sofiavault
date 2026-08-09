@@ -774,6 +774,7 @@ class VaultSession:
         self.entries: list[VaultEntry] = []
         self.corrupt_count = 0
         self.tampered = False
+        self._vault: Optional[Vault] = None  # lazy library wrapper
         self.last_activity = time.time()
         if key is not None:
             self.reload()
@@ -791,6 +792,7 @@ class VaultSession:
         """Drop the key and all decrypted data from memory."""
         self.key = None
         self.entries = []
+        self._vault = None
 
     def unlock_with(self, key: bytes):
         self.key = key
@@ -914,11 +916,13 @@ def cmd_add(session: VaultSession):
     if existing:
         payload = _load_entry_payload(session.conn, session.key, existing.id)
         if payload is None:
-            print_error(f"'{service}' exists but could not be decrypted. It may "
-                        "be corrupted or tampered with; refusing to overwrite it.")
-            print_info("Delete it explicitly first if you want to replace it.")
-            print()
-            return
+            # Unreadable, and the user has confirmed the overwrite. Replacing
+            # in place is a single commit that keeps the row id — and it is
+            # the only way out: an undecryptable row is absent from the
+            # index, so `delete` could never name it.
+            print_warn(f"The stored '{service}' could not be decrypted and has "
+                       "been replaced. Its previous contents were unrecoverable.")
+            payload = {}
         update_entry(session.conn, session.key, existing.id, service,
                      username, payload.get('url', ''), password,
                      payload.get('created_at', ''))
@@ -1075,6 +1079,17 @@ def cmd_edit(session: VaultSession, query: str):
         return
 
     _verify_before_write(session)
+    if not entry_row_exists(session.conn, entry.id):
+        # Deleted by another writer while these prompts were open. UPDATE
+        # would match no row and still report success, losing the password.
+        print()
+        print_error(f"'{entry.service}' was removed from the vault while you "
+                    "were editing it. Nothing was changed.")
+        print_info(f"Store it as a new entry with: add  (service: {new_service})")
+        print()
+        session.reload()
+        return
+
     update_entry(session.conn, session.key, entry.id, new_service, new_username,
                  new_url, new_password, data.get('created_at', ''))
     session.reload()
@@ -1293,8 +1308,19 @@ def cmd_import(session: VaultSession, csv_path: str):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _vault_from_session(session: VaultSession) -> Vault:
-    """Wrap an unlocked CLI session in a library Vault (shares the conn)."""
-    return Vault(session.conn, session.key, paths.DB_PATH)
+    """Wrap an unlocked CLI session in a library Vault (shares the conn).
+
+    Cached on the session: each Vault decrypts the whole entry set on
+    construction, and a fresh one would start with `tampered` False,
+    discarding a mismatch this session has already latched.
+    """
+    vault = getattr(session, '_vault', None)
+    if vault is None or vault._key is not session.key:
+        vault = Vault(session.conn, session.key, paths.DB_PATH)
+        session._vault = vault
+    if session.tampered:
+        vault.tampered = True
+    return vault
 
 
 def cmd_env(session: VaultSession, args: list[str]):

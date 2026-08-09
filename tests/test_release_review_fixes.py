@@ -21,13 +21,16 @@ from sofiavault.cli import (
     VaultSession,
     _refuse_if_tampered,
     _repo_dir,
+    _vault_from_session,
     _verify_before_write,
     _wipe_targets,
     cmd_add,
     cmd_delete,
+    cmd_edit,
 )
 from sofiavault.core import create_master_record
 from sofiavault.storage import (
+    get_entry_by_service,
     get_password,
     get_schema_version,
     init_db,
@@ -752,6 +755,97 @@ def test_t3_partial_env_import_message_is_accurate():
     src = (REPO_ROOT / "sofiavault" / "cli.py").read_text(encoding="utf-8")
     assert "The import stopped partway" in src
     assert "Nothing was imported." in src  # still used for the parse-time abort
+
+
+# ── u1: quoting cases the right-to-left scan got wrong ───────────────────────
+
+def test_u1_junk_after_close_rejects_the_line_and_keeps_later_pairs():
+    pairs = _import_pairs('FOO="bar" baz\nDB_PASSWORD=hunter2\nAPI_KEY="abc"\n')
+    assert pairs["FOO"] is None            # rejected, not swallowed
+    assert pairs["DB_PASSWORD"] == "hunter2"
+    assert pairs["API_KEY"] == "abc"
+
+
+def test_u1_junk_after_close_aborts_the_import_end_to_end():
+    v = Vault.create(Path(tempfile.mkdtemp()) / "secrets.db", PW)
+    env_file = v.path.with_name("app.env")
+    env_file.write_text('FOO="bar" baz\nDB_PASSWORD=hunter2\n')
+    with pytest.raises(envload.MalformedEnvFile):
+        envload.import_env_file(v, env_file)
+    assert v.list_entries() == []
+    v.close()
+
+
+@pytest.mark.parametrize("line,expected", [
+    ('PW="hunter2" # rotate with the "primary"', "hunter2"),
+    ("TOKEN='abc' # see ticket 'OPS-12'", "abc"),
+    ('URL="https://x.io" # prod', "https://x.io"),
+])
+def test_u1_trailing_comment_containing_quotes_is_stripped(line, expected):
+    pairs = _import_pairs(line + "\nNEXT=plain\n")
+    assert list(pairs.values())[0] == expected
+    assert pairs["NEXT"] == "plain"
+
+
+# ── u2: cmd_edit needs the vanished-row check too ────────────────────────────
+
+def test_u2_edit_reports_failure_when_the_row_vanished(capsys):
+    session = _session_with_entry()
+    entry_id = session.entries[0].id
+
+    def _delete_then_answer(_prompt=""):
+        # Another writer removes the row (re-signing the MAC) mid-prompt.
+        session.conn.execute("DELETE FROM entries_v2 WHERE id = ?", (entry_id,))
+        refresh_entries_mac(session.conn, session.key)
+        return ""
+
+    with patch("builtins.input", side_effect=_delete_then_answer), \
+            patch("sofiavault.cli.getpass") as gp:
+        gp.getpass.return_value = "newpass"
+        cmd_edit(session, "amazon")
+
+    out = capsys.readouterr().out
+    assert "Updated" not in out
+    assert "was removed from the vault" in out
+
+
+# ── u3: cmd_add must leave a usable way out for an unreadable entry ──────────
+
+def test_u3_add_replaces_an_unreadable_entry_in_place(capsys):
+    session = _session_with_entry()
+    entry_id = session.entries[0].id
+    session.conn.execute("UPDATE entries_v2 SET blob = ? WHERE id = ?",
+                         (b"\x00" * 40, entry_id))
+    refresh_entries_mac(session.conn, session.key)
+
+    with patch("builtins.input", side_effect=["amazon", "y", "user@x.com"]), \
+            patch("sofiavault.cli.getpass") as gp:
+        gp.getpass.return_value = "recovered"
+        cmd_add(session)
+
+    out = capsys.readouterr().out
+    assert "could not be decrypted and has been replaced" in out
+    session.reload()
+    entry = get_entry_by_service(session.entries, "amazon")
+    assert entry is not None
+    assert get_password(session.conn, session.key, entry.id) == "recovered"
+    # replaced in place: still one row, same id, single commit
+    assert entry.id == entry_id
+    assert session.conn.execute(
+        "SELECT COUNT(*) FROM entries_v2").fetchone()[0] == 1
+
+
+# ── u4: the library wrapper must inherit the session's latched flag ──────────
+
+def test_u4_vault_wrapper_inherits_latched_tamper_flag():
+    session = _session_with_entry()
+    session.tampered = True
+    assert _vault_from_session(session).tampered is True
+
+
+def test_u4_vault_wrapper_is_reused_not_rebuilt():
+    session = _session_with_entry()
+    assert _vault_from_session(session) is _vault_from_session(session)
 
 
 def test_s10_wipe_targets_include_shm_sidecars():
