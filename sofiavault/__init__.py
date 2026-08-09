@@ -146,21 +146,30 @@ from .vault import (  # noqa: F401
 
 
 class _CompatModule(_types.ModuleType):
+    # Every accessor also refreshes the inert __dict__ seed (see below):
+    # mock.patch reads the seed as the "original" to restore on exit, so a
+    # stale seed would resurrect the import-time real ~/.sofiavault path
+    # over a sandbox a test had installed.
+
     @property
     def DB_PATH(self) -> _Path:
+        self.__dict__["DB_PATH"] = paths.DB_PATH
         return paths.DB_PATH
 
     @DB_PATH.setter
     def DB_PATH(self, value):
         paths.DB_PATH = _Path(value)
+        self.__dict__["DB_PATH"] = paths.DB_PATH
 
     @property
     def HISTORY_PATH(self) -> _Path:
+        self.__dict__["HISTORY_PATH"] = paths.HISTORY_PATH
         return paths.HISTORY_PATH
 
     @HISTORY_PATH.setter
     def HISTORY_PATH(self, value):
         paths.HISTORY_PATH = _Path(value)
+        self.__dict__["HISTORY_PATH"] = paths.HISTORY_PATH
 
 
 _sys.modules[__name__].__class__ = _CompatModule

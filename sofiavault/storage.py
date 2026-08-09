@@ -119,8 +119,11 @@ def init_db(db_path: Optional[Path] = None,
         ).fetchone()[0] == 0
     )
     if brand_new:
+        # OR IGNORE: two first-time processes can race past the brand_new
+        # probe together; whoever stamps first wins, the loser must not
+        # crash (and must never clobber a version another writer set).
         conn.execute(
-            "INSERT INTO vault_meta (key, value) VALUES ('schema_version', ?)",
+            "INSERT OR IGNORE INTO vault_meta (key, value) VALUES ('schema_version', ?)",
             (str(SCHEMA_VERSION),)
         )
     else:
@@ -232,6 +235,13 @@ def verify_entries_mac(conn: sqlite3.Connection, key: bytes) -> bool:
     cur = conn.execute("SELECT value FROM vault_meta WHERE key = 'entries_mac'")
     row = cur.fetchone()
     if row is None or not row[0]:
+        # An uninitialized vault has no master record, so there is no key to
+        # authenticate against and nothing yet worth protecting; save_master()
+        # writes the first MAC. Reporting "tampered" here would flag every
+        # freshly created file. Note this is not the entry-wiping attack: that
+        # leaves the master record in place, so it still fails below.
+        if not is_vault_initialized(conn):
+            return True
         if get_schema_version(conn) >= SCHEMA_VERSION:
             return False
         refresh_entries_mac(conn, key)

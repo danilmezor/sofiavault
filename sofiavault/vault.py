@@ -284,7 +284,7 @@ class Vault:
         """
         with self._lock:
             self._require_unlocked()
-            self._require_untampered()
+            self._require_untampered(live=True)
             existing = get_entry_by_service(self._entries, service)
             if existing is None:
                 row_id = save_entry(self._conn, self._key, service, username,
@@ -304,7 +304,7 @@ class Vault:
         """
         with self._lock:
             self._require_unlocked()
-            self._require_untampered()
+            self._require_untampered(live=True)
             meta = get_entry_by_service(self._entries, service)
             if meta is None:
                 raise EntryNotFound(service)
@@ -360,7 +360,13 @@ class Vault:
         if self._key is None:
             raise VaultLocked("vault is closed")
 
-    def _require_untampered(self):
+    def _require_untampered(self, live: bool = False):
+        # Writes pass live=True: they re-sign whatever the database holds
+        # *now*, so the flag cached at the last reload is not enough — a
+        # file rewritten mid-session would be laundered into a valid MAC.
+        # The check is one HMAC over (id, nonce) pairs; no decryption.
+        if live:
+            self.tampered = not verify_entries_mac(self._conn, self._key)
         if self.tampered:
             raise VaultCorrupted(
                 "the set of entries does not match its authentication tag — "

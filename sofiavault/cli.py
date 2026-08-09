@@ -237,7 +237,7 @@ def _repo_dir() -> Optional[Path]:
         return None
     try:
         pyproject = (repo / 'pyproject.toml').read_text(encoding='utf-8')
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return None
     if 'name = "sofiavault"' not in pyproject:
         return None
@@ -706,17 +706,16 @@ def _wipe_targets() -> list[Path]:
     and its Argon2 verifiers are exactly that.
     """
     users_db = paths.DB_PATH.parent / 'users.db'
-    return [
+    targets = [
         paths.DB_PATH,
-        Path(str(paths.DB_PATH) + "-wal"),
-        Path(str(paths.DB_PATH) + "-journal"),
         paths.DB_PATH.with_name(paths.DB_PATH.name + ".v1-backup"),
         paths.DB_PATH.with_name(paths.DB_PATH.name + ".replaced-backup"),
         users_db,
-        Path(str(users_db) + "-wal"),
-        Path(str(users_db) + "-journal"),
         paths.HISTORY_PATH,
     ]
+    for db in (paths.DB_PATH, users_db):
+        targets += [Path(str(db) + suffix) for suffix in ("-wal", "-shm", "-journal")]
+    return targets
 
 
 def cmd_wipe(session: "VaultSession"):
@@ -905,11 +904,19 @@ def cmd_add(session: VaultSession):
 
     # Only replace the existing entry once the replacement is fully
     # collected — an abort above must leave the old entry untouched.
+    _verify_before_write(session)
     if existing:
-        payload = _load_entry_payload(session.conn, session.key, existing.id) or {}
-        update_entry(session.conn, session.key, existing.id, service, username,
-                     payload.get('url', ''), password,
-                     payload.get('created_at', ''))
+        payload = _load_entry_payload(session.conn, session.key, existing.id)
+        if payload is None:
+            # Row vanished or blob unreadable since the index was built —
+            # write a fresh entry rather than UPDATE-ing a ghost row and
+            # reporting success for a password that was never stored.
+            delete_entry(session.conn, existing.id, session.key)
+            save_entry(session.conn, session.key, service, username, password)
+        else:
+            update_entry(session.conn, session.key, existing.id, service,
+                         username, payload.get('url', ''), password,
+                         payload.get('created_at', ''))
     else:
         save_entry(session.conn, session.key, service, username, password)
     session.reload()
@@ -1062,6 +1069,7 @@ def cmd_edit(session: VaultSession, query: str):
         print()
         return
 
+    _verify_before_write(session)
     update_entry(session.conn, session.key, entry.id, new_service, new_username,
                  new_url, new_password, data.get('created_at', ''))
     session.reload()
@@ -1115,6 +1123,7 @@ def cmd_delete(session: VaultSession, query: str):
             f"{style('[y/N]', C.DIM)}: "
         ).strip().lower()
         if confirm == 'y':
+            _verify_before_write(session)
             delete_entry(session.conn, entry.id, session.key)
             session.reload()
             print_success(f"Deleted '{entry.service}'")
@@ -1144,6 +1153,7 @@ def cmd_delete(session: VaultSession, query: str):
                 f"{style('[y/N]', C.DIM)}: "
             ).strip().lower()
             if confirm == 'y':
+                _verify_before_write(session)
                 delete_entry(session.conn, entry.id, session.key)
                 session.reload()
                 print_success(f"Deleted '{entry.service}'")
@@ -1177,6 +1187,7 @@ def cmd_import(session: VaultSession, csv_path: str):
     skipped = 0
     errors = 0
 
+    _verify_before_write(session)
     existing_services = {e.service for e in session.entries}
 
     try:
@@ -1297,6 +1308,13 @@ def cmd_env(session: VaultSession, args: list[str]):
             print_error(f"Could not read {src}: {exc}")
             return
         except envload.MalformedEnvFile as exc:
+            print()
+            print_error(str(exc))
+            print_warn("Nothing was imported.")
+            print()
+            return
+        except VaultCorrupted as exc:
+            # Vault.set re-verifies the entry-set MAC before every write.
             print()
             print_error(str(exc))
             print_warn("Nothing was imported.")
@@ -1768,11 +1786,21 @@ def _refuse_if_tampered(session: VaultSession):
     print()
     print_info("No secrets were revealed or written. If you have a trusted")
     print_info(f"backup, restore it over {paths.DB_PATH} and try again.")
-    print_info("To destroy the vault anyway, delete the files under "
-               f"{paths.DB_PATH.parent} manually.")
+    print_info("To destroy the vault securely instead, run: sofiavault wipe")
     print()
     session.lock()
     sys.exit(1)
+
+
+def _verify_before_write(session: VaultSession):
+    """Re-check the entry-set MAC against the file right before a write.
+
+    The flag from the last reload is not enough: every write re-signs the
+    current row set, so a vault file rewritten while the session sat idle
+    would otherwise be laundered into a fresh valid MAC.
+    """
+    session.tampered = not verify_entries_mac(session.conn, session.key)
+    _refuse_if_tampered(session)
 
 
 def _run_oneshot(args: list[str]):
@@ -1798,7 +1826,10 @@ def _run_oneshot(args: list[str]):
 
     conn, key = _open_vault(show_banner_on_setup=True)
     session = VaultSession(conn, key)
-    _refuse_if_tampered(session)
+    if command != 'wipe':
+        # Wiping must stay reachable on a tampered vault — it is the
+        # documented remediation, and it launders nothing.
+        _refuse_if_tampered(session)
     _warn_corrupt(session)
 
     if command == 'add':
