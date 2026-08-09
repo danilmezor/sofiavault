@@ -318,41 +318,15 @@ def load(path: Union[str, Path, None] = None, *, vault: Optional[Vault] = None,
     return sorted(injected), sorted(skipped)
 
 
-#: `_closing_quote` outcomes other than an index.
-_NO_CLOSE = -1      # no quote on this line could close the value
-_AMBIGUOUS = -2     # a quote closes, but unexplained text follows it
+def _without_trailing_comment(text: str) -> str:
+    """`text` with a whitespace-introduced `#` comment removed from the end.
 
-
-def _closing_quote(text: str, quote: str, first: int) -> int:
-    """Where a quoted value closes: an index, `_NO_CLOSE`, or `_AMBIGUOUS`.
-
-    A value closes at the *first* quote followed by nothing but whitespace
-    or a `#` comment. Taking the first such quote is what strips a trailing
-    comment correctly even when the comment itself contains quotes
-    (`PW="hunter2" # rotate with the "primary"`); continuing past quotes
-    that fail the test is what keeps values merely *containing* the quote
-    character working (`PASS='it's-secret'`, `WIN_DIR='C:\\tools\\'`).
-
-    No escape sequences are interpreted — nothing has to be unescaped on
-    the way out, and a backslash means only itself.
-
-    `_AMBIGUOUS` is reported when some quote could have closed the value
-    but is followed by text that is neither whitespace nor a comment
-    (`FOO="bar" baz`). The caller must not guess: treating that as an
-    unterminated multi-line value silently swallows the following lines,
-    secrets and all.
+    Only used to retry the closing-quote test — never to alter a value that
+    already closed. The last separator wins so a `#` inside the value does
+    not truncate it.
     """
-    candidate = False
-    i = first
-    while True:
-        i = text.find(quote, i)
-        if i == -1:
-            return _AMBIGUOUS if candidate else _NO_CLOSE
-        rest = text[i + 1:].strip()
-        if not rest or rest.startswith('#'):
-            return i
-        candidate = True
-        i += 1
+    cut = max(text.rfind(' #'), text.rfind('\t#'))
+    return text[:cut].rstrip() if cut != -1 else text
 
 
 def _iter_env_pairs(text: str):
@@ -369,15 +343,24 @@ def _iter_env_pairs(text: str):
     the middle line reads as key material to a reviewer, but becomes its
     own injected variable.
 
-    Limit worth knowing, because the format cannot express otherwise: with
-    no escape sequences, a multi-line value ends at the first following
-    line whose quote is not followed by other text. A line *inside* the
-    value that happens to end in the quote character therefore closes it
-    early, and lines after that are read as ordinary entries — the same
-    smuggling shape, reachable by anyone who can write the `.env`. Treat a
-    `.env` as untrusted input: `load(allow=[...])` bounds what may ever be
-    injected regardless of how the file parses, and is the only gate that
-    does not have to anticipate the attacker's choice of name.
+    A quoted value closes on the line whose last character is the quote,
+    ignoring a trailing `#` comment. No escape sequences are interpreted,
+    so a value may contain the quote character and nothing needs
+    unescaping on the way out.
+
+    Two ambiguities are inherent to this format and are resolved toward
+    "keep consuming", which is the choice that cannot invent a variable
+    name out of thin air. Both are documented in SECURITY.md:
+
+      * a line *inside* a multi-line value that ends in the quote
+        character closes it early, so following lines become entries;
+      * a line whose quote closes mid-line with unexplained text after it
+        (`FOO="bar" baz`) reads as the opening of a multi-line value, and
+        the lines it then absorbs are not imported as their own entries.
+
+    Neither can be told apart from a legitimate file by inspection.
+    `load(allow=[...])` is the gate that bounds the damage regardless of
+    how any file parses.
     """
     lines = text.splitlines()
     i = 0
@@ -396,34 +379,32 @@ def _iter_env_pairs(text: str):
         value = value.strip()
         if value[:1] in ('"', "'"):
             quote = value[0]
-            end = _closing_quote(value, quote, 1)
-            if end == _AMBIGUOUS:
-                # Reject the line rather than read it as an unterminated
-                # multi-line value: doing the latter swallows every
-                # following line, so the secrets they define are never
-                # imported and end up buried inside this value instead.
-                yield name, None
+            if len(value) >= 2 and value[-1] == quote:
+                yield name, value[1:-1]
                 continue
-            if end != _NO_CLOSE:
-                yield name, value[1:end]
+            # Same test again with a trailing comment removed. Without this
+            # `FOO="value" # note` reads as an unterminated multi-line value
+            # and swallows the following lines, so the secrets they define
+            # are never imported.
+            head = _without_trailing_comment(value)
+            if len(head) >= 2 and head[-1] == quote:
+                yield name, head[1:-1]
                 continue
-            # Genuinely unterminated: consume following lines until one
-            # closes. A value that never closes stays None, and
-            # import_env_file then imports nothing at all.
             parts = [value[1:]]
             closed = False
             while i < len(lines):
                 nxt = lines[i]
                 i += 1
-                end = _closing_quote(nxt, quote, 0)
-                if end < 0:
-                    # Ambiguity inside a multi-line value is content, not a
-                    # close — a stray quote in a PEM comment must not end it.
-                    parts.append(nxt)
-                    continue
-                parts.append(nxt[:end])
-                closed = True
-                break
+                stripped = nxt.rstrip()
+                if not stripped.endswith(quote):
+                    commented = _without_trailing_comment(stripped)
+                    if commented.endswith(quote) and commented:
+                        stripped = commented
+                if stripped.endswith(quote):
+                    parts.append(stripped[:-1])
+                    closed = True
+                    break
+                parts.append(nxt)
             yield name, ("\n".join(parts) if closed else None)
             continue
 

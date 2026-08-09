@@ -43,6 +43,19 @@ re-authentication prompt.
 
 It does **not** protect against:
 
+- **A hostile `.env` file handed to `env import`.** Dotenv has no escape
+  sequences, so quoting is ambiguous in two shapes that cannot be told
+  apart from legitimate files by inspection: a line *inside* a multi-line
+  quoted value that ends in the quote character closes it early (making
+  the following lines ordinary entries), and a line whose quote closes
+  mid-line with text after it (`FOO="bar" baz`) reads as the opening of a
+  multi-line value and absorbs the lines below it, which are then not
+  imported as their own entries. Anyone who can write the `.env` can use
+  the first to smuggle in a variable name. `envload.load(allow=[...])`
+  bounds what may ever be injected regardless of how a file parses, and
+  is the control to rely on; the denylist is a development safety net.
+  Review a `.env` you did not write before importing it, and check the
+  result with `sofiavault env list`.
 - Keyloggers or malware on the host machine
 - A compromised master password
 - Memory forensics while the vault is unlocked (Python cannot guarantee

