@@ -44,10 +44,14 @@ __all__ = [
 # The historical single-module surface exposed these as assignable globals
 # ("sofiavault.DB_PATH = tmp" pointed every command at a sandbox vault).
 # They now live in sofiavault.paths, and all vault-location code reads
-# paths.* — a plain re-export here would make that assignment a dead
-# attribute nothing reads, silently retargeting commands at the real
-# ~/.sofiavault vault. These forwarding properties keep both reads and
-# writes hitting paths.*, so the old pattern keeps working.
+# paths.* only. Reads forward, so code that merely inspects the location is
+# unaffected; assignment raises instead of forwarding.
+#
+# Forwarding writes was tried and withdrawn. It cannot be done safely: the
+# value has two homes, and unittest.mock.patch restores whichever it sampled
+# first, so a sandbox installed through one name could be silently replaced
+# by the real ~/.sofiavault path mid-test — with cmd_wipe downstream. A
+# refusal costs one edit in a caller; getting it wrong shreds a real vault.
 import sys as _sys
 import types as _types
 from pathlib import Path as _Path
@@ -145,38 +149,32 @@ from .vault import (  # noqa: F401
 )
 
 
-class _CompatModule(_types.ModuleType):
-    # Every accessor also refreshes the inert __dict__ seed (see below):
-    # mock.patch reads the seed as the "original" to restore on exit, so a
-    # stale seed would resurrect the import-time real ~/.sofiavault path
-    # over a sandbox a test had installed.
+def _moved(name: str):
+    raise AttributeError(
+        f"sofiavault.{name} is read-only since 0.3.0 — assign "
+        f"sofiavault.paths.{name} instead (e.g. "
+        f'mock.patch("sofiavault.paths.{name}", tmp)). Everything that '
+        f"opens a vault reads sofiavault.paths.{name}, so assigning it "
+        f"here would have no effect on where the vault is read or written."
+    )
 
+
+class _CompatModule(_types.ModuleType):
     @property
     def DB_PATH(self) -> _Path:
-        self.__dict__["DB_PATH"] = paths.DB_PATH
         return paths.DB_PATH
 
     @DB_PATH.setter
     def DB_PATH(self, value):
-        paths.DB_PATH = _Path(value)
-        self.__dict__["DB_PATH"] = paths.DB_PATH
+        _moved("DB_PATH")
 
     @property
     def HISTORY_PATH(self) -> _Path:
-        self.__dict__["HISTORY_PATH"] = paths.HISTORY_PATH
         return paths.HISTORY_PATH
 
     @HISTORY_PATH.setter
     def HISTORY_PATH(self, value):
-        paths.HISTORY_PATH = _Path(value)
-        self.__dict__["HISTORY_PATH"] = paths.HISTORY_PATH
+        _moved("HISTORY_PATH")
 
 
 _sys.modules[__name__].__class__ = _CompatModule
-
-# Seed inert module-__dict__ entries so unittest.mock.patch("sofiavault.DB_PATH")
-# sees the attribute as local and restores the original on exit. Reads and
-# writes never touch these: the properties above are data descriptors, which
-# take precedence over the instance __dict__.
-_sys.modules[__name__].__dict__["DB_PATH"] = paths.DB_PATH
-_sys.modules[__name__].__dict__["HISTORY_PATH"] = paths.HISTORY_PATH

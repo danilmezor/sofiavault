@@ -235,13 +235,6 @@ def verify_entries_mac(conn: sqlite3.Connection, key: bytes) -> bool:
     cur = conn.execute("SELECT value FROM vault_meta WHERE key = 'entries_mac'")
     row = cur.fetchone()
     if row is None or not row[0]:
-        # An uninitialized vault has no master record, so there is no key to
-        # authenticate against and nothing yet worth protecting; save_master()
-        # writes the first MAC. Reporting "tampered" here would flag every
-        # freshly created file. Note this is not the entry-wiping attack: that
-        # leaves the master record in place, so it still fails below.
-        if not is_vault_initialized(conn):
-            return True
         if get_schema_version(conn) >= SCHEMA_VERSION:
             return False
         refresh_entries_mac(conn, key)
@@ -375,6 +368,18 @@ def load_entries(conn: sqlite3.Connection, key: bytes) -> tuple[list[VaultEntry]
             corrupt += 1
     entries.sort(key=lambda e: e.service)
     return entries, corrupt
+
+
+def entry_row_exists(conn: sqlite3.Connection, entry_id: int) -> bool:
+    """True if the row is still present.
+
+    _load_entry_payload() returns None for both "row is gone" and "blob
+    will not decrypt"; those need opposite handling on a write path, so
+    callers separate them with this.
+    """
+    return conn.execute(
+        "SELECT 1 FROM entries_v2 WHERE id = ?", (entry_id,)
+    ).fetchone() is not None
 
 
 def _load_entry_payload(conn: sqlite3.Connection, key: bytes,

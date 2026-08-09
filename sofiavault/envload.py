@@ -318,23 +318,24 @@ def load(path: Union[str, Path, None] = None, *, vault: Optional[Vault] = None,
     return sorted(injected), sorted(skipped)
 
 
-def _find_closing_quote(text: str, quote: str, start: int) -> int:
-    """Index of the first unescaped `quote` at/after `start`, or -1.
+def _closing_quote(text: str, quote: str, first: int) -> int:
+    """Index of the quote that closes a quoted value, or -1 if none does.
 
-    A quote preceded by an odd number of backslashes is escaped content,
-    not a closer — KEY="say \\"hi\\"" must not end at the interior quote.
+    A value closes at the last quote followed by nothing but whitespace or
+    a `#` comment. Scanning from the right keeps values that merely
+    *contain* the quote character working — PASS='it's-secret',
+    WIN_DIR='C:\\tools\\' — exactly as they always have; understanding a
+    trailing comment is the only behaviour this adds. No escape sequences
+    are interpreted, so nothing has to be unescaped on the way out.
     """
-    for i in range(start, len(text)):
-        if text[i] != quote:
-            continue
-        backslashes = 0
-        j = i - 1
-        while j >= 0 and text[j] == '\\':
-            backslashes += 1
-            j -= 1
-        if backslashes % 2 == 0:
-            return i
-    return -1
+    end = len(text)
+    while True:
+        end = text.rfind(quote, first, end)
+        if end == -1:
+            return -1
+        rest = text[end + 1:].strip()
+        if not rest or rest.startswith('#'):
+            return end
 
 
 def _iter_env_pairs(text: str):
@@ -368,37 +369,26 @@ def _iter_env_pairs(text: str):
         value = value.strip()
         if value[:1] in ('"', "'"):
             quote = value[0]
-            end = _find_closing_quote(value, quote, 1)
+            end = _closing_quote(value, quote, 1)
             if end != -1:
-                # Closed on its own line. Only whitespace or a comment may
-                # follow the closing quote — anything else is ambiguous, and
-                # guessing here silently swallows whatever comes next. One
-                # leniency, for values with interior quotes that dotenv
-                # tooling historically accepted (PASS='it's-secret'): a line
-                # that *ends* on the quote closes there.
-                rest = value[end + 1:].strip()
-                if not rest or rest.startswith('#'):
-                    yield name, value[1:end]
-                elif value[-1] == quote:
-                    yield name, value[1:-1]
-                else:
-                    yield name, None
+                yield name, value[1:end]
                 continue
+            # Does not close on its own line: consume following lines until
+            # one does. A line that never closes leaves the value None, and
+            # import_env_file then imports nothing at all — the point is that
+            # ambiguous quoting can never silently turn a line of key
+            # material into its own injected variable.
             parts = [value[1:]]
             closed = False
             while i < len(lines):
                 nxt = lines[i]
                 i += 1
-                end = _find_closing_quote(nxt, quote, 0)
+                end = _closing_quote(nxt, quote, 0)
                 if end == -1:
                     parts.append(nxt)
                     continue
-                # Same rule as the single-line close: trailing content other
-                # than a comment is ambiguous and must not be absorbed.
-                rest = nxt[end + 1:].strip()
-                if not rest or rest.startswith('#'):
-                    parts.append(nxt[:end])
-                    closed = True
+                parts.append(nxt[:end])
+                closed = True
                 break
             yield name, ("\n".join(parts) if closed else None)
             continue

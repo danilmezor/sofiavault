@@ -37,6 +37,7 @@ from .storage import (
     _load_entry_payload,
     _shred_file,
     delete_entry,
+    entry_row_exists,
     fuzzy_find_service,
     get_entry_by_service,
     get_master_data,
@@ -782,8 +783,9 @@ class VaultSession:
         self.entries, self.corrupt_count = load_entries(self.conn, self.key)
         # Same entry-set check the library enforces: detects whole-blob
         # rollback, row insertion, and row deletion, which per-entry
-        # authentication cannot see.
-        self.tampered = not verify_entries_mac(self.conn, self.key)
+        # authentication cannot see. Latched — see _verify_before_write.
+        if not verify_entries_mac(self.conn, self.key):
+            self.tampered = True
 
     def lock(self):
         """Drop the key and all decrypted data from memory."""
@@ -905,18 +907,21 @@ def cmd_add(session: VaultSession):
     # Only replace the existing entry once the replacement is fully
     # collected — an abort above must leave the old entry untouched.
     _verify_before_write(session)
+    if existing and not entry_row_exists(session.conn, existing.id):
+        # The row went away after the index was built; UPDATE would match
+        # nothing and report success for a password that was never stored.
+        existing = None
     if existing:
         payload = _load_entry_payload(session.conn, session.key, existing.id)
         if payload is None:
-            # Row vanished or blob unreadable since the index was built —
-            # write a fresh entry rather than UPDATE-ing a ghost row and
-            # reporting success for a password that was never stored.
-            delete_entry(session.conn, existing.id, session.key)
-            save_entry(session.conn, session.key, service, username, password)
-        else:
-            update_entry(session.conn, session.key, existing.id, service,
-                         username, payload.get('url', ''), password,
-                         payload.get('created_at', ''))
+            print_error(f"'{service}' exists but could not be decrypted. It may "
+                        "be corrupted or tampered with; refusing to overwrite it.")
+            print_info("Delete it explicitly first if you want to replace it.")
+            print()
+            return
+        update_entry(session.conn, session.key, existing.id, service,
+                     username, payload.get('url', ''), password,
+                     payload.get('created_at', ''))
     else:
         save_entry(session.conn, session.key, service, username, password)
     session.reload()
@@ -1314,10 +1319,13 @@ def cmd_env(session: VaultSession, args: list[str]):
             print()
             return
         except VaultCorrupted as exc:
-            # Vault.set re-verifies the entry-set MAC before every write.
+            # Vault.set re-verifies the entry-set MAC before every write, and
+            # each set commits as it goes — so this can land partway through.
             print()
             print_error(str(exc))
-            print_warn("Nothing was imported.")
+            print_warn("The import stopped partway. Entries written before this "
+                       "point are already in the vault.")
+            print_info("Check with: sofiavault env list")
             print()
             return
         session.reload()
@@ -1798,8 +1806,13 @@ def _verify_before_write(session: VaultSession):
     The flag from the last reload is not enough: every write re-signs the
     current row set, so a vault file rewritten while the session sat idle
     would otherwise be laundered into a fresh valid MAC.
+
+    Latched, never cleared: any writer holding the master key re-signs on
+    every write, so a MAC that verifies again later says nothing about the
+    edit this session already saw.
     """
-    session.tampered = not verify_entries_mac(session.conn, session.key)
+    if not verify_entries_mac(session.conn, session.key):
+        session.tampered = True
     _refuse_if_tampered(session)
 
 

@@ -12,13 +12,20 @@ from sofiavault import (
     get_entry_by_service,
     get_password,
     init_db,
+    save_master,
 )
 
 
 def _make_session(db_tmp: str) -> VaultSession:
+    key = secrets.token_bytes(KEY_SIZE)
     with patch("sofiavault.paths.DB_PATH", Path(db_tmp)):
         conn = init_db()
-    return VaultSession(conn, secrets.token_bytes(KEY_SIZE))
+    # A session only ever exists for an initialized vault: setup_master (or
+    # Vault.create) writes the master record and the first entry-set MAC
+    # before anything builds one. Skipping that leaves a v3 vault with no
+    # MAC — which the tamper check rightly refuses.
+    save_master(conn, b'x' * 16, b'y' * 32, key)
+    return VaultSession(conn, key)
 
 
 def _make_csv(content: str) -> str:

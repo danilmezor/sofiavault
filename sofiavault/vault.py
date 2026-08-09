@@ -22,6 +22,7 @@ from .storage import (
     _load_entry_payload,
     backup_legacy_vault,
     delete_entry,
+    entry_row_exists,
     fuzzy_find_service,
     get_entry_by_service,
     get_master_data,
@@ -286,11 +287,21 @@ class Vault:
             self._require_unlocked()
             self._require_untampered(live=True)
             existing = get_entry_by_service(self._entries, service)
+            if existing is not None and not entry_row_exists(self._conn, existing.id):
+                # The row went away after this index was built (another
+                # writer deleted it). UPDATE-ing it would match nothing and
+                # silently lose the secret the caller asked us to store.
+                existing = None
             if existing is None:
                 row_id = save_entry(self._conn, self._key, service, username,
                                     password, url)
             else:
-                payload = _load_entry_payload(self._conn, self._key, existing.id) or {}
+                payload = _load_entry_payload(self._conn, self._key, existing.id)
+                if payload is None:
+                    raise VaultCorrupted(
+                        f"entry '{service}' failed authenticated decryption; "
+                        "refusing to overwrite it"
+                    )
                 update_entry(self._conn, self._key, existing.id, service, username,
                              url, password, payload.get('created_at', ''))
                 row_id = existing.id
@@ -353,8 +364,11 @@ class Vault:
     def _reload(self):
         self._entries, self.corrupt_count = load_entries(self._conn, self._key)
         # Detects whole-blob rollback, row insertion, and row deletion —
-        # none of which per-entry authentication can see on its own.
-        self.tampered = not verify_entries_mac(self._conn, self._key)
+        # none of which per-entry authentication can see on its own. Raises
+        # the flag only; __init__ establishes the initial False, and nothing
+        # afterwards may lower it (see _require_untampered).
+        if not verify_entries_mac(self._conn, self._key):
+            self.tampered = True
 
     def _require_unlocked(self):
         if self._key is None:
@@ -365,8 +379,10 @@ class Vault:
         # *now*, so the flag cached at the last reload is not enough — a
         # file rewritten mid-session would be laundered into a valid MAC.
         # The check is one HMAC over (id, nonce) pairs; no decryption.
-        if live:
-            self.tampered = not verify_entries_mac(self._conn, self._key)
+        # Only ever raises the flag: another writer re-signing the set does
+        # not undo the edit this instance already observed.
+        if live and not verify_entries_mac(self._conn, self._key):
+            self.tampered = True
         if self.tampered:
             raise VaultCorrupted(
                 "the set of entries does not match its authentication tag — "
