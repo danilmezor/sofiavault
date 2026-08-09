@@ -283,9 +283,11 @@ sofiavault wipe               # permanently destroys the vault on this machine
   backs up any existing local vault to `vault.db.replaced-backup`, then
   copies it into place. Works on a brand-new device with no vault yet.
 - **wipe** asks for your master password plus a typed confirmation phrase,
-  then overwrites the vault, its backups, and the command history with
-  random data (3 passes) before deleting them. Only SofiaVault's own files
-  are touched — nothing else on disk. Note: on SSDs and copy-on-write
+  then overwrites the vault, its backups, the local user auth store, and the
+  command history with random data (3 passes) before deleting them. Only
+  SofiaVault's own files are touched — nothing else on disk. It stays
+  available on a vault that fails its tamper check, so a compromised vault
+  can always be destroyed securely. Note: on SSDs and copy-on-write
   filesystems, software overwriting can't guarantee physical erasure;
   full-disk encryption (FileVault/BitLocker/LUKS) is the reliable backstop.
 

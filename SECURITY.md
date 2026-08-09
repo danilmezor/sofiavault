@@ -25,6 +25,11 @@ SofiaVault is designed to protect passwords at rest on a single machine. It prot
 - Ciphertext tampering and entry relabeling — each entry is a single authenticated
   AES-256-GCM blob, so an attacker with file access cannot swap a password onto a
   different service name without detection
+- Rollback, insertion, and deletion of whole entries — a MAC over the entry set
+  is checked when the vault is opened *and* again immediately before every
+  write, so a file edited while a session is unlocked cannot be laundered into
+  a fresh valid tag. Both the CLI and the library refuse to read or write a
+  vault that fails this check
 - Other local users reading the vault — the vault directory and files are created
   with owner-only permissions (0700 / 0600 on POSIX systems)
 - Clipboard scraping over time — copied passwords are automatically cleared from
@@ -129,8 +134,9 @@ the `.v1-backup` file — it still contains the old plaintext metadata.
 
 `sofiavault wipe` requires the master password plus a typed confirmation
 phrase. It then overwrites an explicit allowlist of SofiaVault's own files
-(`vault.db`, its WAL/journal, migration and import backups, and the command
-history) with 3 passes of CSPRNG data, fsyncing between passes, before
+(`vault.db`, its WAL/journal sidecars, migration and import backups, the
+user auth store `users.db` created by `sofiavault auth import`, and the
+command history) with 3 passes of CSPRNG data, fsyncing between passes, before
 deleting them. Symlinks are removed without following, and no directory is
 swept — files outside the allowlist are never touched.
 
