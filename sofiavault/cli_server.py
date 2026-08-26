@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Optional
 
 from . import envload, paths
+from .auth import AuthStoreError, UserStore
 from .core import KEY_SIZE
 from .storage import get_schema_version, verify_entries_mac
 from .vault import (
@@ -453,10 +454,49 @@ def cmd_doctor(args) -> int:
         else:
             _check_allow(rep, args.allow, None)
 
+    users_db = Path(args.users_db).expanduser() if args.users_db else (
+        paths.USERS_DB_PATH if paths.USERS_DB_PATH_FROM_ENV else None)
+    if users_db is not None:
+        _check_users_db(rep, users_db)
+
     for line in rep.lines:
         print(line)
     print(f"{len(rep.problems)} problem(s)")
     return EXIT_OK if not rep.problems else EXIT_ERROR
+
+
+def _check_users_db(rep: _Report, users_db: Path):
+    import sqlite3
+    if not users_db.exists():
+        rep.problem(f"user store {users_db} does not exist")
+        return
+    try:
+        conn = sqlite3.connect(f"file:{users_db}?mode=ro", uri=True)
+        try:
+            meta = dict(conn.execute("SELECT key, value FROM auth_meta"))
+            users = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        rep.problem(f"user store {users_db} is unreadable: {exc}")
+        return
+    rep.ok(f"user store {users_db}: schema v{meta.get('schema_version', '?')}, "
+           f"{users} users")
+    if meta.get("fields_encrypted") != "1":
+        rep.warn(f"user store {users_db} has no fields key: profile fields are plaintext "
+                 "and TOTP / recovery codes / reset tokens are unavailable — create a "
+                 "new store with SOFIAVAULT_FIELDS_KEY[_FILE] and import-sqlite into it")
+    elif _fields_key_present() is False:
+        rep.problem("user store encrypts fields but no SOFIAVAULT_FIELDS_KEY[_FILE] is set")
+    else:
+        rep.ok("user store fields key configured")
+
+
+def _fields_key_present() -> bool:
+    try:
+        return _fields_key() is not None
+    except VaultLocked:
+        return False
 
 
 def _check_allow(rep: _Report, allow_arg: Optional[str], names: Optional[list]):
@@ -478,6 +518,166 @@ def _check_allow(rep: _Report, allow_arg: Optional[str], names: Optional[list]):
                     "sofiavault env set NAME < value")
     else:
         rep.ok("every allowlisted name is present in the vault")
+
+
+# ── auth ────────────────────────────────────────────────────────────────────
+
+def _users_db(arg: Optional[str]) -> Path:
+    if arg:
+        return Path(arg).expanduser()
+    if paths.USERS_DB_PATH_FROM_ENV:
+        print(f"using user store from SOFIAVAULT_USERS_DB: {paths.USERS_DB_PATH}",
+              file=sys.stderr)
+    return paths.USERS_DB_PATH
+
+
+def _fields_key() -> Optional[bytes]:
+    """SOFIAVAULT_FIELDS_KEY (base64) or SOFIAVAULT_FIELDS_KEY_FILE (0600)."""
+    from .vault import _decode_key
+    raw = os.environ.get("SOFIAVAULT_FIELDS_KEY")
+    if raw:
+        return _decode_key(raw, "SOFIAVAULT_FIELDS_KEY")
+    key_file = os.environ.get("SOFIAVAULT_FIELDS_KEY_FILE")
+    if key_file:
+        key_path = Path(key_file).expanduser()
+        check_private_file(key_path, "SOFIAVAULT_FIELDS_KEY_FILE")
+        try:
+            return _decode_key(key_path.read_text(encoding="utf-8").strip(),
+                               "SOFIAVAULT_FIELDS_KEY_FILE")
+        except OSError as exc:
+            raise VaultLocked(f"cannot read SOFIAVAULT_FIELDS_KEY_FILE: {exc}") from exc
+    return None
+
+
+def _store(args) -> UserStore:
+    db = _users_db(args.db)
+    try:
+        return UserStore(db, pepper=os.environ.get("SOFIAVAULT_PEPPER"),
+                         fields_key=_fields_key())
+    except AuthStoreError as exc:
+        raise _Exit(EXIT_ERROR, str(exc)) from exc
+
+
+def cmd_auth_import_json(args) -> int:
+    if getattr(args, "deprecated_alias", False):
+        _warn("'auth import' is deprecated; use 'auth import-json'")
+    src = Path(args.file).expanduser()
+    if not src.exists():
+        raise _Exit(EXIT_ERROR, f"file not found: {src}")
+    with _store(args) as store:
+        try:
+            created, skipped = store.import_json(src)
+        except (AuthStoreError, ValueError) as exc:
+            raise _Exit(EXIT_ERROR, f"import failed: {exc}") from exc
+    for name in created:
+        print(f"created {name}")
+    for name in skipped:
+        print(f"skipped {name}")
+    _warn(f"{src} held PLAINTEXT passwords: delete it, purge it from version control, "
+          "and rotate every imported password (sofiavault auth reset USER)")
+    return EXIT_OK
+
+
+def cmd_auth_import_sqlite(args) -> int:
+    src = Path(args.source).expanduser()
+    if not src.exists():
+        raise _Exit(EXIT_ERROR, f"file not found: {src}")
+    columns = {}
+    for item in args.map or ():
+        ours, sep, theirs = item.partition("=")
+        if not sep or not ours or not theirs:
+            raise _Usage(f"--map expects OURS=THEIRS, got {item!r}")
+        columns[ours] = theirs
+    with _store(args) as store:
+        try:
+            created, skipped = store.import_sqlite(src, args.table, scheme=args.scheme,
+                                                   columns=columns)
+        except AuthStoreError as exc:
+            raise _Exit(EXIT_ERROR, f"import failed: {exc}") from exc
+    for name in created:
+        print(f"created {name}")
+    for name in skipped:
+        print(f"skipped {name}")
+    print(f"{len(created)} user(s) imported with scheme {args.scheme!r}; they upgrade "
+          "to Argon2id on first login", file=sys.stderr)
+    return EXIT_OK
+
+
+def cmd_auth_list(args) -> int:
+    with _store(args) as store:
+        for name in store.list_users(include_inactive=not args.active_only,
+                                     role=args.role, admin_only=args.admins):
+            if args.verbose:
+                info = store.get_user(name) if store._fields_key or not store._fields_encrypted \
+                    else None
+                flags = []
+                if info:
+                    if info["is_admin"]:
+                        flags.append("admin")
+                    if info["role"]:
+                        flags.append(f"role={info['role']}")
+                    if not info["is_active"]:
+                        flags.append("inactive")
+                    if info["totp"] != "off":
+                        flags.append(f"totp={info['totp']}")
+                    if info["legacy"]:
+                        flags.append("legacy-hash")
+                print(name + ("  " + " ".join(flags) if flags else ""))
+            else:
+                print(name)
+    return EXIT_OK
+
+
+def cmd_auth_reset(args) -> int:
+    with _store(args) as store:
+        try:
+            token = store.reset_token_issue(args.user, ttl_seconds=args.ttl)
+        except AuthStoreError as exc:
+            raise _Exit(EXIT_ERROR, str(exc)) from exc
+    print(token)
+    print(f"one-time reset token for {args.user}, valid {args.ttl}s; shown once",
+          file=sys.stderr)
+    return EXIT_OK
+
+
+def cmd_auth_totp(args) -> int:
+    with _store(args) as store:
+        try:
+            if args.action == "status":
+                print(store.totp_status(args.user))
+            else:
+                if not store.totp_disable(args.user):
+                    raise _Exit(EXIT_NOT_FOUND, f"unknown user {args.user!r}")
+                print(f"totp disabled for {args.user}", file=sys.stderr)
+        except AuthStoreError as exc:
+            raise _Exit(EXIT_ERROR, str(exc)) from exc
+    return EXIT_OK
+
+
+def cmd_auth_set_flag(args) -> int:
+    changes = []
+    if args.admin:
+        changes.append(("admin", lambda s: s.set_admin(args.user, True)))
+    if args.no_admin:
+        changes.append(("no-admin", lambda s: s.set_admin(args.user, False)))
+    if args.active:
+        changes.append(("active", lambda s: s.set_active(args.user, True)))
+    if args.inactive:
+        changes.append(("inactive", lambda s: s.set_active(args.user, False)))
+    if args.role is not None:
+        changes.append((f"role={args.role}", lambda s: s.set_role(args.user, args.role)))
+    if not changes:
+        raise _Usage("nothing to set: give --admin/--no-admin, --active/--inactive or --role")
+    with _store(args) as store:
+        for label, apply in changes:
+            try:
+                ok = apply(store)
+            except AuthStoreError as exc:
+                raise _Exit(EXIT_ERROR, str(exc)) from exc
+            if not ok:
+                raise _Exit(EXIT_NOT_FOUND, f"unknown user {args.user!r}")
+            print(f"{args.user}: {label}", file=sys.stderr)
+    return EXIT_OK
 
 
 # ── parser ──────────────────────────────────────────────────────────────────
@@ -554,11 +754,70 @@ def build_parser() -> argparse.ArgumentParser:
     vault_opt(p)
     p.add_argument("--key-file", metavar="FILE", help="default: $SOFIAVAULT_KEY_FILE")
     p.add_argument("--allow", metavar="FILE", help="default: $SOFIAVAULT_ALLOW_FILE")
+    p.add_argument("--users-db", metavar="PATH", help="also check a user store "
+                   "(default: $SOFIAVAULT_USERS_DB if set)")
     p.set_defaults(func=cmd_doctor)
+
+    auth = sub.add_parser("auth", help="manage the user credential store")
+    auth_sub = auth.add_subparsers(dest="auth_command", required=True)
+
+    def db_opt(q):
+        q.add_argument("--db", metavar="PATH",
+                       help="user store (default: $SOFIAVAULT_USERS_DB or "
+                            "~/.sofiavault/users.db)")
+
+    q = auth_sub.add_parser("import-json", help="import a plaintext JSON credentials file")
+    q.add_argument("file")
+    db_opt(q)
+    q.set_defaults(func=cmd_auth_import_json)
+    q = auth_sub.add_parser("import", help="alias of import-json (deprecated)")
+    q.add_argument("file")
+    db_opt(q)
+    q.set_defaults(func=cmd_auth_import_json, deprecated_alias=True)
+
+    q = auth_sub.add_parser("import-sqlite",
+                            help="import users with their existing hashes from a SQLite table")
+    q.add_argument("source")
+    q.add_argument("--table", required=True)
+    q.add_argument("--scheme", required=True, help="legacy hash scheme, e.g. bcrypt-sha256-pepper")
+    q.add_argument("--map", action="append", metavar="OURS=THEIRS",
+                   help="column mapping (username, password_hash, role, is_admin, is_active)")
+    db_opt(q)
+    q.set_defaults(func=cmd_auth_import_sqlite)
+
+    q = auth_sub.add_parser("list", help="list users")
+    db_opt(q)
+    q.add_argument("--admins", action="store_true")
+    q.add_argument("--role", metavar="R")
+    q.add_argument("--active-only", action="store_true")
+    q.add_argument("-v", "--verbose", action="store_true", help="show flags")
+    q.set_defaults(func=cmd_auth_list)
+
+    q = auth_sub.add_parser("reset", help="issue a one-time password-reset token")
+    q.add_argument("user")
+    q.add_argument("--ttl", type=int, default=3600, metavar="SECONDS")
+    db_opt(q)
+    q.set_defaults(func=cmd_auth_reset)
+
+    q = auth_sub.add_parser("totp", help="inspect or disable a user's TOTP")
+    q.add_argument("action", choices=("status", "disable"))
+    q.add_argument("user")
+    db_opt(q)
+    q.set_defaults(func=cmd_auth_totp)
+
+    q = auth_sub.add_parser("set-flag", help="set admin/active/role flags")
+    q.add_argument("user")
+    q.add_argument("--admin", action="store_true")
+    q.add_argument("--no-admin", action="store_true")
+    q.add_argument("--active", action="store_true")
+    q.add_argument("--inactive", action="store_true")
+    q.add_argument("--role", metavar="R")
+    db_opt(q)
+    q.set_defaults(func=cmd_auth_set_flag)
     return root
 
 
-SERVER_COMMANDS = ("env", "run", "rekey", "doctor")
+SERVER_COMMANDS = ("env", "run", "rekey", "doctor", "auth")
 
 
 def main(argv: list) -> int:
@@ -586,6 +845,9 @@ def main(argv: list) -> int:
     except VaultLocked as exc:
         _err(str(exc))
         return EXIT_USAGE
+    except AuthStoreError as exc:
+        _err(str(exc))
+        return EXIT_ERROR
     except VaultError as exc:
         _err(str(exc))
         return EXIT_ERROR

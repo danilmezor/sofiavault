@@ -1585,8 +1585,10 @@ def print_oneshot_help():
           f"{style('Rotate the master key', C.DIM)}")
     print(f"  sofiavault {style('doctor', C.CYAN)}               "
           f"{style('Check a deployment would boot', C.DIM)}")
-    print(f"  sofiavault {style('auth import', C.CYAN)} {style('<json>', C.DIM)}   "
-          f"{style('Build a verify-only user store', C.DIM)}")
+    print(f"  sofiavault {style('auth import-json', C.CYAN)} {style('<json>', C.DIM)} "
+          f"{style('Build a user credential store', C.DIM)}")
+    print(f"  sofiavault {style('auth', C.CYAN)} {style('list|reset|totp|set-flag', C.DIM)} "
+          f"{style('Operate the user store', C.DIM)}")
     print(f"  sofiavault {style('key', C.CYAN)}                  "
           f"{style('Print master key for SOFIAVAULT_KEY', C.DIM)}")
     print()
@@ -1873,9 +1875,6 @@ def _run_oneshot(args: list[str]):
         # unlock chain, exit codes. `env import`/`env list` keep their 0.3.0
         # meaning; they simply no longer prompt when stdin is not a TTY.
         sys.exit(cli_server.main(args))
-    if command == 'auth':
-        cmd_auth(args[1:])
-        return
     if command == 'import' and len(args) > 1 \
             and _is_vault_file(Path(args[1]).expanduser()):
         # Importing a vault file must work on a fresh device with no local vault
