@@ -38,6 +38,9 @@ dev = [
 keyring = [
     "keyring>=24.0",
 ]
+legacy-bcrypt = [
+    "bcrypt>=4.0",
+]
 
 [project.scripts]
 sofiavault = "sofiavault.cli:main"

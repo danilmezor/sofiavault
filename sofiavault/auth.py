@@ -13,12 +13,21 @@ plaintext password, and needs no master key to verify.
 Never use the retrievable Vault for end-user credentials — a breached
 server must yield slow hashes, not decryptable passwords.
 
-Out of scope by design (the caller's job): sessions/JWT, TOTP, rate
-limiting, lockout. This module only answers "is this password correct,
-and who is this user".
+Since 0.4.0 the store is a complete *credential* store for humans:
+Argon2id passwords, TOTP with an atomic replay guard, single-use recovery
+codes, one-time password-reset tokens, typed role/admin/active flags, and a
+legacy-verifier path that migrates bcrypt-style hashes on first login. What
+stays the caller's job: sessions/JWT, rate limiting, lockout — policy, not
+credentials.
+
+TOTP seeds, recovery-code tags and reset-token tags are only ever stored
+under `fields_key`; a store created without one can hold password-only users
+and nothing else.
 """
 
+import base64
 import contextlib
+import hashlib
 import hmac
 import json
 import os
@@ -28,13 +37,14 @@ import sqlite3
 import threading
 import time
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, Union
+from typing import Callable, Optional, Union
 
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
+from . import totp as _totp
 from .core import (
     ARGON2_MEMORY_COST,
     ARGON2_PARALLELISM,
@@ -46,6 +56,35 @@ from .core import (
 )
 
 AUTH_CONTEXT = b"sofiavault-auth-v1"
+AUTH_SCHEMA_VERSION = 2
+
+#: Columns added by schema v2, in ALTER order. Module-level so a test can
+#: inject a failure mid-migration and prove the transaction rolls back.
+_V2_COLUMNS = (
+    ("role", "TEXT NOT NULL DEFAULT ''"),
+    ("is_admin", "INTEGER NOT NULL DEFAULT 0"),
+    ("totp_enc", "BLOB"),
+    ("totp_counter", "INTEGER NOT NULL DEFAULT -1"),
+    ("totp_confirmed", "INTEGER NOT NULL DEFAULT 0"),
+    ("recovery_enc", "BLOB"),
+    ("legacy_hash", "TEXT"),
+    ("password_changed_at", "TEXT NOT NULL DEFAULT ''"),
+)
+
+_ROW_COLUMNS = (
+    'username', 'salt', 'verify_hash', 'time_cost', 'memory_cost', 'parallelism',
+    'fields', 'fields_enc', 'is_active', 'created_at', 'updated_at',
+) + tuple(name for name, _ in _V2_COLUMNS)
+
+#: Recovery codes: 10 symbols from a 32-symbol alphabet (50 bits). 0/O and
+#: 1/I are excluded as visually ambiguous; input is case-folded so `l` reads
+#: as L and hyphens/spaces are ignored.
+RECOVERY_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+RECOVERY_CODE_LENGTH = 10
+_MFA_KEY_REQUIRED = (
+    "fields_key required for MFA/reset tokens; this store was created without one "
+    "— create a new store with a key and import-sqlite from this one"
+)
 
 #: Characters that must never appear in a username: C0/C1 controls, NUL,
 #: bidi/zero-width marks, and other format characters. They enable log
@@ -145,9 +184,50 @@ def normalize_username(username: str, *, max_length: int = 128) -> str:
 
 @dataclass
 class AuthResult:
-    """Successful verification: who authenticated and their profile fields."""
+    """What a successful verify() tells the application.
+
+    `totp` is "off", "pending" or "active": an app that gates on MFA should
+    demand a code only when it is "active" (a pending enrolment was never
+    confirmed by the user and must not lock them out).
+    """
     username: str
-    fields: dict
+    fields: dict = field(default_factory=dict)
+    role: str = ''
+    is_admin: bool = False
+    is_active: bool = True
+    totp: str = "off"
+    password_changed_at: str = ''
+
+
+LegacyVerifier = Callable[[str, str], bool]
+
+
+class LegacyBcryptSha256Pepper:
+    """`bcrypt(base64(sha256(password + pepper)))` — the pre-hash-then-bcrypt
+    scheme some apps use to dodge bcrypt's 72-byte limit. Needs the
+    `sofiavault[legacy-bcrypt]` extra.
+    """
+
+    scheme = "bcrypt-sha256-pepper"
+
+    def __init__(self, pepper: str = ""):
+        if not isinstance(pepper, str):
+            raise AuthStoreError("pepper must be a string")
+        self._pepper = pepper
+
+    def __call__(self, password: str, payload: str) -> bool:
+        try:
+            import bcrypt
+        except ImportError as exc:  # pragma: no cover - environment dependent
+            raise AuthStoreError(
+                "legacy bcrypt verification needs the 'bcrypt' package "
+                "(pip install 'sofiavault[legacy-bcrypt]')"
+            ) from exc
+        digest = hashlib.sha256((password + self._pepper).encode('utf-8')).digest()
+        try:
+            return bcrypt.checkpw(base64.b64encode(digest), payload.encode('ascii'))
+        except (ValueError, UnicodeEncodeError):
+            return False
 
 
 class UserStore:
@@ -166,7 +246,8 @@ class UserStore:
     """
 
     def __init__(self, path: Union[str, Path], pepper: Optional[str] = None,
-                 fields_key: Optional[bytes] = None):
+                 fields_key: Optional[bytes] = None,
+                 legacy_verifiers: Optional[dict] = None):
         # `pepper or ""` accepted b"pep" and 0 and turned them into "no
         # pepper" or a TypeError at the first hash — either way the operator
         # believed the store was peppered when it was not.
@@ -182,6 +263,13 @@ class UserStore:
         self._fields_encrypted = self._fields_key is not None
         self._dummy_cost_cache: Optional[tuple[int, int, int]] = None
         self._dummy_cost_version: Optional[int] = None
+        self._legacy: dict = {}
+        for scheme, verifier in (legacy_verifiers or {}).items():
+            if not isinstance(scheme, str) or not scheme or '$' in scheme:
+                raise AuthStoreError(f"invalid legacy scheme name: {scheme!r}")
+            if not callable(verifier):
+                raise AuthStoreError(f"legacy verifier for {scheme!r} is not callable")
+            self._legacy[scheme] = verifier
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         # Create at 0600 before sqlite opens it: a file created under the
         # umask is briefly world-readable, and an fd opened in that window
@@ -212,7 +300,8 @@ class UserStore:
             raise
 
     def _init_schema(self):
-        self._conn.execute("""
+        v2_defs = ",\n".join(f"                {n} {d}" for n, d in _V2_COLUMNS)
+        self._conn.execute(f"""
             CREATE TABLE IF NOT EXISTS users (
                 username TEXT PRIMARY KEY,
                 salt BLOB NOT NULL,
@@ -220,18 +309,33 @@ class UserStore:
                 time_cost INTEGER NOT NULL,
                 memory_cost INTEGER NOT NULL,
                 parallelism INTEGER NOT NULL,
-                fields TEXT NOT NULL DEFAULT '{}',
+                fields TEXT NOT NULL DEFAULT '{{}}',
                 fields_enc BLOB,
                 is_active INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+{v2_defs}
             )
         """)
         self._conn.execute(
             "CREATE TABLE IF NOT EXISTS auth_meta (key TEXT PRIMARY KEY, value TEXT)"
         )
+        # Migrate before anything else writes: a failed migration must leave
+        # a v1 file byte-identical, and a read-only v1 file must surface as
+        # the typed "needs write access to migrate" error, not a raw sqlite
+        # error from an unrelated CREATE TABLE.
+        self._migrate_v1_to_v2()
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS reset_tokens (
+                username TEXT PRIMARY KEY,
+                tag BLOB NOT NULL,
+                expires_at REAL NOT NULL,
+                issued_at REAL NOT NULL
+            )
+        """)
         self._conn.execute(
-            "INSERT OR IGNORE INTO auth_meta (key, value) VALUES ('schema_version', '1')"
+            "INSERT OR IGNORE INTO auth_meta (key, value) VALUES ('schema_version', ?)",
+            (str(AUTH_SCHEMA_VERSION),)
         )
         # A per-store random salt for the anti-enumeration dummy hash, so
         # unknown-user verification cost matches real verification cost.
@@ -247,6 +351,55 @@ class UserStore:
             self._dummy_salt = bytes.fromhex(row[0])
         self._init_fields_policy()
         self._conn.commit()
+
+    def _schema_version(self) -> int:
+        row = self._conn.execute(
+            "SELECT value FROM auth_meta WHERE key = 'schema_version'").fetchone()
+        try:
+            return int(row[0]) if row else 1
+        except (TypeError, ValueError) as exc:
+            raise AuthStoreError(f"auth_meta.schema_version is malformed: {row[0]!r}") from exc
+
+    def _migrate_v1_to_v2(self):
+        """Add the v2 columns to a 0.3.0 store, atomically.
+
+        Every ALTER, the timestamp backfill and the version stamp run in one
+        explicit transaction (Python's sqlite3 does not open one for DDL on
+        its own), so a failure part-way leaves a v1 store that still opens.
+        """
+        if not self._conn.execute(
+                "SELECT COUNT(*) FROM auth_meta WHERE key = 'schema_version'").fetchone()[0]:
+            return  # brand-new store: created at v2 above, stamped below
+        if self._schema_version() >= AUTH_SCHEMA_VERSION:
+            return
+        have = {r[1] for r in self._conn.execute("PRAGMA table_info(users)")}
+        try:
+            if self._conn.in_transaction:
+                self._conn.commit()
+            self._conn.execute("BEGIN")
+            for name, definition in _V2_COLUMNS:
+                if name not in have:
+                    self._conn.execute(f"ALTER TABLE users ADD COLUMN {name} {definition}")
+            self._conn.execute(
+                "UPDATE users SET password_changed_at = updated_at "
+                "WHERE password_changed_at = ''")
+            self._conn.execute(
+                "INSERT OR REPLACE INTO auth_meta (key, value) VALUES ('schema_version', ?)",
+                (str(AUTH_SCHEMA_VERSION),))
+            self._conn.commit()
+        except sqlite3.OperationalError as exc:
+            with contextlib.suppress(sqlite3.Error):
+                self._conn.rollback()
+            if 'readonly' in str(exc).lower() or 'read-only' in str(exc).lower():
+                raise AuthStoreError(
+                    f"{self.path} is a schema v1 user store on a read-only file; "
+                    "it needs write access once to migrate to v2"
+                ) from exc
+            raise AuthStoreError(f"schema v1→v2 migration failed: {exc}") from exc
+        except BaseException:
+            with contextlib.suppress(sqlite3.Error):
+                self._conn.rollback()
+            raise
 
     def _init_fields_policy(self):
         """Decide, once per store, whether profile fields must be encrypted.
@@ -346,6 +499,41 @@ class UserStore:
         """
         return AUTH_CONTEXT + b"|" + username.encode('utf-8')
 
+    @staticmethod
+    def _mfa_aad(username: str, label: bytes) -> bytes:
+        """AAD for TOTP seeds / recovery tags: a distinct label per slot so a
+        seed blob cannot be transplanted into the fields slot or vice versa."""
+        return AUTH_CONTEXT + b"|" + username.encode('utf-8') + b"|" + label
+
+    def _require_fields_key(self) -> bytes:
+        if self._fields_key is None:
+            raise AuthStoreError(_MFA_KEY_REQUIRED)
+        return self._fields_key
+
+    def _seal(self, payload: bytes, username: str, label: bytes) -> bytes:
+        key = self._require_fields_key()
+        nonce = secrets.token_bytes(NONCE_SIZE)
+        return nonce + AESGCM(key).encrypt(nonce, payload, self._mfa_aad(username, label))
+
+    def _unseal(self, blob, username: str, label: bytes) -> bytes:
+        key = self._require_fields_key()
+        if not isinstance(blob, (bytes, bytearray)) or len(blob) < _MIN_FIELDS_ENC:
+            raise AuthStoreError(
+                f"{label.decode()} material for {username!r} is truncated")
+        blob = bytes(blob)
+        try:
+            return AESGCM(key).decrypt(blob[:NONCE_SIZE], blob[NONCE_SIZE:],
+                                       self._mfa_aad(username, label))
+        except InvalidTag as exc:
+            raise FieldsTampered(
+                f"{label.decode()} material for {username!r} failed authentication"
+            ) from exc
+
+    def _tag(self, value: str) -> bytes:
+        """Keyed tag for recovery codes and reset tokens: useless without the key."""
+        return hmac.new(self._require_fields_key(), value.encode('utf-8'),
+                        hashlib.sha256).digest()
+
     def _encode_fields(self, fields: dict, username: str) -> tuple[str, Optional[bytes]]:
         if self._fields_encrypted and self._fields_key is None:
             raise AuthStoreError(
@@ -438,23 +626,35 @@ class UserStore:
         """
         return self._create_user(username, password, fields)
 
-    def _create_user(self, username: str, password: str, fields: dict) -> bool:
+    def _create_user(self, username: str, password: Optional[str], fields: dict, *,
+                     role: str = '', is_admin: bool = False, is_active: bool = True,
+                     legacy_hash: Optional[str] = None) -> bool:
         username = normalize_username(username)
-        _require_password(password)
+        if legacy_hash is None:
+            _require_password(password)
+        if not isinstance(role, str):
+            raise AuthStoreError("role must be a string")
         with self._lock:
             if self._row(username) is not None:
                 return False
             salt = secrets.token_bytes(SALT_SIZE)
-            verify_hash = self._hash(password, salt)
+            if legacy_hash is None:
+                verify_hash = self._hash(password, salt)
+            else:
+                # Placeholder that can never match: the legacy verifier is the
+                # only way in until the first successful login rewrites it.
+                verify_hash = secrets.token_bytes(KEY_SIZE)
             fields_text, fields_enc = self._encode_fields(fields, username)
             now = _utcnow()
             try:
                 self._conn.execute(
                     "INSERT INTO users (username, salt, verify_hash, time_cost, memory_cost,"
-                    " parallelism, fields, fields_enc, is_active, created_at, updated_at)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
+                    " parallelism, fields, fields_enc, is_active, created_at, updated_at,"
+                    " role, is_admin, legacy_hash, password_changed_at)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (username, salt, verify_hash, ARGON2_TIME_COST, ARGON2_MEMORY_COST,
-                     ARGON2_PARALLELISM, fields_text, fields_enc, now, now)
+                     ARGON2_PARALLELISM, fields_text, fields_enc, 1 if is_active else 0,
+                     now, now, role, 1 if is_admin else 0, legacy_hash, now)
                 )
                 self._conn.commit()
             except sqlite3.IntegrityError:
@@ -475,22 +675,35 @@ class UserStore:
                 return False
             self._write_password(username, password, (ARGON2_TIME_COST,
                                                       ARGON2_MEMORY_COST,
-                                                      ARGON2_PARALLELISM))
+                                                      ARGON2_PARALLELISM),
+                                 changed=True)
             return True
 
     def _write_password(self, username: str, password: str,
-                        costs: tuple[int, int, int]):
-        """Re-salt and re-hash an existing row at the given cost parameters."""
+                        costs: tuple[int, int, int], *, changed: bool = False,
+                        commit: bool = True):
+        """Re-salt and re-hash an existing row at the given cost parameters.
+
+        `changed=True` means the *password* is new (set_password, reset):
+        it stamps password_changed_at. A rehash-on-verify or a legacy
+        upgrade keeps the old stamp — the user did not change anything.
+        Both paths clear legacy_hash: once an Argon2 row exists the legacy
+        verifier must never be consulted again.
+        """
         time_cost, memory_cost, parallelism = costs
         salt = secrets.token_bytes(SALT_SIZE)
         verify_hash = self._hash(password, salt, time_cost, memory_cost, parallelism)
+        now = _utcnow()
         self._conn.execute(
             "UPDATE users SET salt = ?, verify_hash = ?, time_cost = ?,"
-            " memory_cost = ?, parallelism = ?, updated_at = ? WHERE username = ?",
-            (salt, verify_hash, time_cost, memory_cost, parallelism,
-             _utcnow(), username)
+            " memory_cost = ?, parallelism = ?, updated_at = ?, legacy_hash = NULL"
+            + (", password_changed_at = ?" if changed else "")
+            + " WHERE username = ?",
+            (salt, verify_hash, time_cost, memory_cost, parallelism, now)
+            + ((now,) if changed else ()) + (username,)
         )
-        self._conn.commit()
+        if commit:
+            self._conn.commit()
         self._dummy_cost_cache = None
 
     def update_fields(self, username: str, /, **fields) -> bool:
@@ -516,6 +729,27 @@ class UserStore:
                 "UPDATE users SET is_active = ?, updated_at = ? WHERE username = ?",
                 (1 if active else 0, _utcnow(), username)
             )
+            self._conn.commit()
+            return cur.rowcount > 0
+
+    def set_role(self, username: str, role: str) -> bool:
+        """Set the plaintext role label (queryable; not a secret)."""
+        if not isinstance(role, str):
+            raise AuthStoreError("role must be a string")
+        username = normalize_username(username)
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE users SET role = ?, updated_at = ? WHERE username = ?",
+                (role, _utcnow(), username))
+            self._conn.commit()
+            return cur.rowcount > 0
+
+    def set_admin(self, username: str, is_admin: bool) -> bool:
+        username = normalize_username(username)
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE users SET is_admin = ?, updated_at = ? WHERE username = ?",
+                (1 if is_admin else 0, _utcnow(), username))
             self._conn.commit()
             return cur.rowcount > 0
 
@@ -553,14 +787,29 @@ class UserStore:
                 'is_active': bool(row['is_active']),
                 'created_at': row['created_at'],
                 'updated_at': row['updated_at'],
+                'role': row['role'] if isinstance(row['role'], str) else '',
+                'is_admin': _is_truthy_active(row['is_admin']),
+                'totp': _totp_status(row),
+                'legacy': row['legacy_hash'] is not None,
+                'password_changed_at': row['password_changed_at'],
             }
 
-    def list_users(self, include_inactive: bool = True) -> list[str]:
+    def list_users(self, include_inactive: bool = True, *, role: Optional[str] = None,
+                   admin_only: bool = False) -> list[str]:
+        """Usernames, optionally filtered by typed flags (no field decryption)."""
         sql = "SELECT username FROM users"
+        where, params = [], []
         if not include_inactive:
-            sql += " WHERE is_active = 1"
+            where.append("is_active = 1")
+        if role is not None:
+            where.append("role = ?")
+            params.append(role)
+        if admin_only:
+            where.append("is_admin = 1")
+        if where:
+            sql += " WHERE " + " AND ".join(where)
         with self._lock:
-            return [r[0] for r in self._conn.execute(sql + " ORDER BY username")]
+            return [r[0] for r in self._conn.execute(sql + " ORDER BY username", params)]
 
     # ── Verification ─────────────────────────────────────────────────────
 
@@ -596,6 +845,9 @@ class UserStore:
                 self._burn_dummy_hash(password)
                 return None
 
+            if row['legacy_hash'] is not None:
+                return self._verify_legacy(row, password)
+
             costs = _validated_costs(row['time_cost'], row['memory_cost'],
                                      row['parallelism'])
             salt = _validated_blob(row['salt'], 'salt', SALT_SIZE)
@@ -625,11 +877,347 @@ class UserStore:
             if target != costs:
                 self._write_password(row['username'], password, target)
 
-            return AuthResult(
-                username=row['username'],
-                fields=self._decode_fields(row['fields'], row['fields_enc'],
-                                           row['username']),
+            return self._result(row)
+
+    def _result(self, row: dict) -> AuthResult:
+        return AuthResult(
+            username=row['username'],
+            fields=self._decode_fields(row['fields'], row['fields_enc'],
+                                       row['username']),
+            role=row['role'] if isinstance(row['role'], str) else '',
+            is_admin=_is_truthy_active(row['is_admin']),
+            is_active=_is_truthy_active(row['is_active']),
+            totp=_totp_status(row),
+            password_changed_at=row['password_changed_at'] or '',
+        )
+
+    def _verify_legacy(self, row: dict, password: str) -> Optional[AuthResult]:
+        """A row imported with its old hash: run the pluggable verifier once.
+
+        On success the password is re-stored as Argon2id and legacy_hash is
+        cleared, so the legacy scheme is consulted at most once per user.
+        The Argon2 decoy is burned as well so the path pays at least the
+        ceiling; the legacy scheme's own cost comes on top, which is why
+        SECURITY.md documents legacy rows as timing-distinguishable until
+        their first successful login.
+        """
+        scheme, sep, payload = str(row['legacy_hash']).partition('$')
+        verifier = self._legacy.get(scheme) if sep else None
+        if verifier is None:
+            # Never a silent None: the operator configured an import for a
+            # scheme this process cannot verify, and every login for that
+            # user would otherwise look like a wrong password.
+            self._burn_dummy_hash(password)
+            raise AuthStoreError(
+                f"no legacy verifier registered for scheme {scheme!r} "
+                f"(user {row['username']!r}); pass legacy_verifiers= to UserStore"
             )
+        self._burn_dummy_hash(password)
+        if not verifier(password, payload):
+            return None
+        self._write_password(row['username'], password,
+                             (ARGON2_TIME_COST, ARGON2_MEMORY_COST, ARGON2_PARALLELISM))
+        return self._result(self._row(row['username']))
+
+    # ── TOTP ─────────────────────────────────────────────────────────────
+
+    def totp_enroll(self, username: str) -> str:
+        """Issue a new TOTP secret, stored *pending* until totp_confirm().
+
+        Returns the base32 secret for the user to save (build the QR with
+        sofiavault.totp.provisioning_uri). Replaces any earlier enrolment.
+        """
+        username = normalize_username(username)
+        self._require_fields_key()
+        secret = _totp.generate_secret()
+        with self._lock:
+            if self._row(username) is None:
+                raise AuthStoreError(f"unknown user {username!r}")
+            self._conn.execute(
+                "UPDATE users SET totp_enc = ?, totp_counter = -1, totp_confirmed = 0,"
+                " recovery_enc = NULL, updated_at = ? WHERE username = ?",
+                (self._seal(secret.encode('ascii'), username, b"totp"), _utcnow(),
+                 username))
+            self._conn.commit()
+        return secret
+
+    def totp_confirm(self, username: str, code: str, *, now: Optional[float] = None) -> bool:
+        """Activate a pending enrolment with its first valid code."""
+        return self._totp_check(username, code, now, confirm=True)
+
+    def totp_verify(self, username: str, code: str, *, now: Optional[float] = None) -> bool:
+        """Check a code against an *active* enrolment, atomically bumping the
+        replay counter: a time-step is accepted once, ever, per user."""
+        return self._totp_check(username, code, now, confirm=False)
+
+    def _totp_check(self, username: str, code: str, now: Optional[float],
+                    confirm: bool) -> bool:
+        try:
+            username = normalize_username(username)
+        except InvalidUsername:
+            return False
+        self._require_fields_key()
+        t = time.time() if now is None else now
+        with self._lock:
+            # BEGIN IMMEDIATE takes the write lock before the counter is read,
+            # so two processes submitting the same code serialize here and
+            # the second sees the bumped counter.
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._row(username)
+                if row is None or row['totp_enc'] is None:
+                    return False
+                confirmed = _is_truthy_active(row['totp_confirmed'])
+                if confirm == confirmed:
+                    return False   # confirm needs pending; verify needs active
+                secret = self._unseal(row['totp_enc'], username, b"totp").decode('ascii')
+                try:
+                    last = int(row['totp_counter'])
+                except (TypeError, ValueError) as exc:
+                    raise AuthStoreError("stored totp_counter is not an integer") from exc
+                accepted = _totp.verify(secret, code, t, last_counter=last)
+                if accepted is None:
+                    return False
+                self._conn.execute(
+                    "UPDATE users SET totp_counter = ?, totp_confirmed = 1, updated_at = ?"
+                    " WHERE username = ? AND totp_counter = ?",
+                    (accepted, _utcnow(), username, last))
+                return True
+            finally:
+                # commit on success, rollback otherwise — a refused code must
+                # not leave the write lock held
+                self._conn.commit()
+
+    def totp_disable(self, username: str) -> bool:
+        """Remove the seed, the replay counter and any recovery codes."""
+        username = normalize_username(username)
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE users SET totp_enc = NULL, totp_counter = -1, totp_confirmed = 0,"
+                " recovery_enc = NULL, updated_at = ? WHERE username = ?",
+                (_utcnow(), username))
+            self._conn.commit()
+            return cur.rowcount > 0
+
+    def totp_status(self, username: str) -> str:
+        """"off", "pending" or "active"."""
+        username = normalize_username(username)
+        with self._lock:
+            row = self._row(username)
+        if row is None:
+            raise AuthStoreError(f"unknown user {username!r}")
+        return _totp_status(row)
+
+    # ── Recovery codes ───────────────────────────────────────────────────
+
+    def recovery_generate(self, username: str, count: int = 8) -> list:
+        """Mint `count` single-use codes (xxxxx-xxxxx); replaces any old set.
+
+        Only keyed HMAC tags are stored, so the codes are shown once, here.
+        """
+        username = normalize_username(username)
+        if not 1 <= int(count) <= 64:
+            raise AuthStoreError("count must be between 1 and 64")
+        self._require_fields_key()
+        codes = []
+        for _ in range(int(count)):
+            raw = "".join(secrets.choice(RECOVERY_ALPHABET) for _ in range(RECOVERY_CODE_LENGTH))
+            codes.append(raw[:5] + "-" + raw[5:])
+        tags = [self._tag(_normalize_recovery_code(c)).hex() for c in codes]
+        with self._lock:
+            if self._row(username) is None:
+                raise AuthStoreError(f"unknown user {username!r}")
+            self._conn.execute(
+                "UPDATE users SET recovery_enc = ?, updated_at = ? WHERE username = ?",
+                (self._seal(json.dumps(tags).encode('ascii'), username, b"recovery"),
+                 _utcnow(), username))
+            self._conn.commit()
+        return codes
+
+    def _recovery_tags(self, row: dict, username: str) -> list:
+        if row['recovery_enc'] is None:
+            return []
+        try:
+            tags = json.loads(self._unseal(row['recovery_enc'], username, b"recovery"))
+        except ValueError as exc:
+            raise AuthStoreError(f"recovery codes for {username!r} are malformed") from exc
+        if not isinstance(tags, list) or not all(isinstance(t, str) for t in tags):
+            raise AuthStoreError(f"recovery codes for {username!r} are malformed")
+        return tags
+
+    def recovery_use(self, username: str, code: str) -> bool:
+        """Consume a recovery code. True exactly once per code."""
+        try:
+            username = normalize_username(username)
+        except InvalidUsername:
+            return False
+        if not isinstance(code, str):
+            return False
+        self._require_fields_key()
+        tag = self._tag(_normalize_recovery_code(code)).hex()
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._row(username)
+                if row is None:
+                    return False
+                tags = self._recovery_tags(row, username)
+                # Compare against every tag so timing does not leak the index.
+                matched = [i for i, t in enumerate(tags)
+                           if hmac.compare_digest(t.encode(), tag.encode())]
+                if not matched:
+                    return False
+                del tags[matched[0]]
+                self._conn.execute(
+                    "UPDATE users SET recovery_enc = ?, updated_at = ? WHERE username = ?",
+                    (self._seal(json.dumps(tags).encode('ascii'), username, b"recovery"),
+                     _utcnow(), username))
+                return True
+            finally:
+                self._conn.commit()
+
+    def recovery_remaining(self, username: str) -> int:
+        username = normalize_username(username)
+        with self._lock:
+            row = self._row(username)
+            if row is None:
+                raise AuthStoreError(f"unknown user {username!r}")
+            if row['recovery_enc'] is None:
+                return 0
+            return len(self._recovery_tags(row, username))
+
+    # ── Password-reset tokens ────────────────────────────────────────────
+
+    def reset_token_issue(self, username: str, ttl_seconds: int = 3600) -> str:
+        """A one-time, URL-safe 256-bit token; only its keyed tag is stored.
+
+        Issuing does not change the password. One live token per user: a
+        new one replaces the old.
+        """
+        username = normalize_username(username)
+        if not isinstance(ttl_seconds, (int, float)) or ttl_seconds <= 0:
+            raise AuthStoreError("ttl_seconds must be positive")
+        self._require_fields_key()
+        token = secrets.token_urlsafe(32)
+        now = time.time()
+        with self._lock:
+            if self._row(username) is None:
+                raise AuthStoreError(f"unknown user {username!r}")
+            self._conn.execute(
+                "INSERT OR REPLACE INTO reset_tokens (username, tag, expires_at, issued_at)"
+                " VALUES (?, ?, ?, ?)",
+                (username, self._tag(token), now + float(ttl_seconds), now))
+            self._conn.commit()
+        return token
+
+    def reset_token_redeem(self, token: str, new_password: str) -> Optional[str]:
+        """Set a new password if `token` is live. Returns the username, else None.
+
+        The token is consumed either way once found; an expired one is
+        removed. Clears legacy_hash and stamps password_changed_at. The app
+        decides what to do with the user's sessions.
+        """
+        if not isinstance(token, str) or not token:
+            return None
+        _require_password(new_password)
+        self._require_fields_key()
+        tag = self._tag(token)
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute(
+                    "SELECT username, tag, expires_at FROM reset_tokens").fetchall()
+                hit = None
+                for username, stored, expires_at in row:
+                    if isinstance(stored, (bytes, bytearray)) and \
+                            hmac.compare_digest(bytes(stored), tag):
+                        hit = (username, expires_at)
+                if hit is None:
+                    return None
+                username, expires_at = hit
+                self._conn.execute("DELETE FROM reset_tokens WHERE username = ?", (username,))
+                if not isinstance(expires_at, (int, float)) or time.time() > expires_at:
+                    return None
+                if self._row(username) is None:
+                    return None
+                self._write_password(username, new_password,
+                                     (ARGON2_TIME_COST, ARGON2_MEMORY_COST,
+                                      ARGON2_PARALLELISM), changed=True, commit=False)
+                return username
+            finally:
+                self._conn.commit()
+
+    def reset_token_revoke(self, username: str) -> bool:
+        username = normalize_username(username)
+        with self._lock:
+            cur = self._conn.execute("DELETE FROM reset_tokens WHERE username = ?", (username,))
+            self._conn.commit()
+            return cur.rowcount > 0
+
+    # ── Legacy-store import ──────────────────────────────────────────────
+
+    def import_sqlite(self, path: Union[str, Path], table: str, *, scheme: str,
+                      columns: Optional[dict] = None) -> tuple[list[str], list[str]]:
+        """Copy users and their *existing* hashes from another SQLite table.
+
+        `columns` maps our names to the source's: username, password_hash,
+        and optionally role, is_admin, is_active (defaults: the same names;
+        missing optional columns are ignored). Each user is stored with
+        `legacy_hash = "<scheme>$<hash>"` and a placeholder Argon2 row; the
+        first successful verify() through the matching legacy verifier
+        rewrites them as Argon2id. Existing users are skipped. Returns
+        (created, skipped).
+        """
+        if not isinstance(scheme, str) or not scheme or '$' in scheme:
+            raise AuthStoreError(f"invalid legacy scheme name: {scheme!r}")
+        if not re.match(r'^[A-Za-z_][A-Za-z0-9_]*$', table):
+            raise AuthStoreError(f"invalid table name: {table!r}")
+        cols = {"username": "username", "password_hash": "password_hash",
+                "role": "role", "is_admin": "is_admin", "is_active": "is_active"}
+        cols.update(columns or {})
+        for ours, theirs in cols.items():
+            if not re.match(r'^[A-Za-z_][A-Za-z0-9_]*$', str(theirs)):
+                raise AuthStoreError(f"invalid column name for {ours}: {theirs!r}")
+        src = sqlite3.connect(f"file:{Path(path)}?mode=ro", uri=True)
+        try:
+            have = {r[1] for r in src.execute(f"PRAGMA table_info({table})")}
+            if not have:
+                raise AuthStoreError(f"no table {table!r} in {path}")
+            for required in ("username", "password_hash"):
+                if cols[required] not in have:
+                    raise AuthStoreError(
+                        f"{table} has no column {cols[required]!r} (for {required})")
+            optional = [k for k in ("role", "is_admin", "is_active") if cols[k] in have]
+            select = ", ".join([cols["username"], cols["password_hash"]]
+                               + [cols[k] for k in optional])
+            rows = src.execute(f"SELECT {select} FROM {table}").fetchall()
+        finally:
+            src.close()
+        created, skipped = [], []
+        for row in rows:
+            raw_name, raw_hash = row[0], row[1]
+            extra = dict(zip(optional, row[2:]))
+            label = raw_name if isinstance(raw_name, str) else repr(raw_name)
+            if not isinstance(raw_name, str) or not isinstance(raw_hash, str) or not raw_hash:
+                skipped.append(f"{label} (missing username or hash)")
+                continue
+            try:
+                username = normalize_username(raw_name)
+            except InvalidUsername as exc:
+                skipped.append(f"{label} ({exc})")
+                continue
+            role = extra.get("role")
+            ok = self._create_user(
+                username, None, {},
+                role=role if isinstance(role, str) else '',
+                is_admin=_truthy(extra.get("is_admin", 0)),
+                is_active=_truthy(extra.get("is_active", 1)),
+                legacy_hash=f"{scheme}${raw_hash}")
+            if ok:
+                created.append(username)
+            else:
+                skipped.append(f"{username} (already exists)")
+        return created, skipped
 
     # ── Bulk import ──────────────────────────────────────────────────────
 
@@ -708,17 +1296,30 @@ class UserStore:
 
     def _row(self, username: str) -> Optional[dict]:
         cur = self._conn.execute(
-            "SELECT username, salt, verify_hash, time_cost, memory_cost,"
-            " parallelism, fields, fields_enc, is_active, created_at, updated_at"
-            " FROM users WHERE username = ?", (username,)
+            "SELECT " + ", ".join(_ROW_COLUMNS) + " FROM users WHERE username = ?",
+            (username,)
         )
         row = cur.fetchone()
         if row is None:
             return None
-        keys = ('username', 'salt', 'verify_hash', 'time_cost', 'memory_cost',
-                'parallelism', 'fields', 'fields_enc', 'is_active',
-                'created_at', 'updated_at')
-        return dict(zip(keys, row))
+        return dict(zip(_ROW_COLUMNS, row))
+
+
+def _totp_status(row: dict) -> str:
+    if row['totp_enc'] is None:
+        return "off"
+    return "active" if _is_truthy_active(row['totp_confirmed']) else "pending"
+
+
+def _normalize_recovery_code(code: str) -> str:
+    return code.strip().replace("-", "").replace(" ", "").upper()
+
+
+def _truthy(value) -> bool:
+    """Lenient reading of a *source* store's flag column during import."""
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "y", "t")
+    return bool(value)
 
 
 def _utf8_encodable(value: str) -> bool:

@@ -27,7 +27,8 @@ __all__ = [
     "VaultReadOnly",
     # auth
     "UserStore", "AuthResult", "AuthStoreError", "InvalidUsername",
-    "normalize_username",
+    "FieldsTampered", "LegacyBcryptSha256Pepper", "normalize_username",
+    "totp",
     # env
     "envload", "paths",
     # 0.2.x compatibility aliases for the CLI's default locations
@@ -57,11 +58,17 @@ import sys as _sys
 import types as _types
 from pathlib import Path as _Path
 
-from . import envload, paths  # noqa: F401  (isort: after siblings to avoid cycle)
+from . import (  # noqa: F401  (isort: after siblings to avoid cycle)
+    envload,
+    paths,
+    totp,  # noqa: F401
+)
 from .auth import (  # noqa: F401
     AuthResult,
     AuthStoreError,
+    FieldsTampered,
     InvalidUsername,
+    LegacyBcryptSha256Pepper,
     UserStore,
     normalize_username,
 )
