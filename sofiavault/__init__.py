@@ -13,7 +13,7 @@ deliberate exception: delete_entry now requires the master key so the
 entry-set MAC is re-signed instead of stripped (see CHANGELOG, 0.3.0).
 """
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 #: The supported public surface. Private helpers (notably the destructive
 #: _shred_file) are reachable via their modules but are deliberately not

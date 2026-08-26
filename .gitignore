@@ -36,3 +36,6 @@ Thumbs.db
 # Environment / secrets
 .env
 .env.*
+
+# Checked-in test fixtures (test-only credentials, see make_fixtures.py)
+!tests/fixtures/**/*.db
