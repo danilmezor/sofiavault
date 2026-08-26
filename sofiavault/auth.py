@@ -69,6 +69,9 @@ _V2_COLUMNS = (
     ("recovery_enc", "BLOB"),
     ("legacy_hash", "TEXT"),
     ("password_changed_at", "TEXT NOT NULL DEFAULT ''"),
+    # HMAC over (username, role, is_admin, is_active) under fields_key, so the
+    # plaintext policy columns are as tamper-evident as the encrypted fields.
+    ("flags_tag", "BLOB"),
 )
 
 _ROW_COLUMNS = (
@@ -372,6 +375,18 @@ class UserStore:
             return  # brand-new store: created at v2 above, stamped below
         if self._schema_version() >= AUTH_SCHEMA_VERSION:
             return
+        # The typed flags of an encrypting store are authenticated under
+        # fields_key from the moment they exist, so migrating such a store
+        # needs the key once. Read the policy directly: _init_fields_policy
+        # has not run yet.
+        meta = self._conn.execute(
+            "SELECT value FROM auth_meta WHERE key = 'fields_encrypted'").fetchone()
+        encrypting = (meta is not None and meta[0] == '1') or self._fields_key is not None
+        if encrypting and self._fields_key is None:
+            raise AuthStoreError(
+                f"{self.path} is a schema v1 store that encrypts fields; open it with "
+                "fields_key once so the v2 migration can authenticate its flags"
+            )
         have = {r[1] for r in self._conn.execute("PRAGMA table_info(users)")}
         try:
             if self._conn.in_transaction:
@@ -383,6 +398,13 @@ class UserStore:
             self._conn.execute(
                 "UPDATE users SET password_changed_at = updated_at "
                 "WHERE password_changed_at = ''")
+            if encrypting:
+                rows = self._conn.execute("SELECT username, is_active FROM users").fetchall()
+                for username, is_active in rows:
+                    self._conn.execute(
+                        "UPDATE users SET flags_tag = ? WHERE username = ?",
+                        (self._flags_tag(username, '', False, _is_truthy_active(is_active)),
+                         username))
             self._conn.execute(
                 "INSERT OR REPLACE INTO auth_meta (key, value) VALUES ('schema_version', ?)",
                 (str(AUTH_SCHEMA_VERSION),))
@@ -504,6 +526,46 @@ class UserStore:
         """AAD for TOTP seeds / recovery tags: a distinct label per slot so a
         seed blob cannot be transplanted into the fields slot or vice versa."""
         return AUTH_CONTEXT + b"|" + username.encode('utf-8') + b"|" + label
+
+    def _flags_tag(self, username: str, role: str, is_admin: bool, is_active: bool) -> bytes:
+        """Keyed tag binding the typed flags to one user of this store."""
+        msg = b"|".join([AUTH_CONTEXT, username.encode('utf-8'), b"flags",
+                         role.encode('utf-8'), b"1" if is_admin else b"0",
+                         b"1" if is_active else b"0"])
+        return hmac.new(self._require_fields_key(), msg, hashlib.sha256).digest()
+
+    def _flags_tag_for(self, username: str, role: str, is_admin: bool,
+                       is_active: bool) -> Optional[bytes]:
+        """The tag to store: None on a plaintext-policy store, else required."""
+        if not self._fields_encrypted:
+            return None
+        if self._fields_key is None:
+            raise AuthStoreError(
+                "this store encrypts profile fields; construct UserStore with fields_key"
+            )
+        return self._flags_tag(username, role, is_admin, is_active)
+
+    def _check_flags(self, row: dict):
+        """Raise FieldsTampered if the typed flags were not written by this store.
+
+        Only an encrypting store carries tags; on a plaintext-policy store the
+        flags are as unauthenticated as the rest of the row (documented).
+        """
+        if not self._fields_encrypted:
+            return
+        if self._fields_key is None:
+            raise AuthStoreError(
+                "profile flags are authenticated; construct UserStore with fields_key"
+            )
+        role = row['role'] if isinstance(row['role'], str) else None
+        stored = row['flags_tag']
+        if role is None or not isinstance(stored, (bytes, bytearray)):
+            raise FieldsTampered(f"flags for {row['username']!r} failed authentication")
+        expected = self._flags_tag(row['username'], role,
+                                   _is_truthy_active(row['is_admin']),
+                                   _is_truthy_active(row['is_active']))
+        if not hmac.compare_digest(bytes(stored), expected):
+            raise FieldsTampered(f"flags for {row['username']!r} failed authentication")
 
     def _require_fields_key(self) -> bytes:
         if self._fields_key is None:
@@ -645,16 +707,17 @@ class UserStore:
                 # only way in until the first successful login rewrites it.
                 verify_hash = secrets.token_bytes(KEY_SIZE)
             fields_text, fields_enc = self._encode_fields(fields, username)
+            flags_tag = self._flags_tag_for(username, role, bool(is_admin), bool(is_active))
             now = _utcnow()
             try:
                 self._conn.execute(
                     "INSERT INTO users (username, salt, verify_hash, time_cost, memory_cost,"
                     " parallelism, fields, fields_enc, is_active, created_at, updated_at,"
-                    " role, is_admin, legacy_hash, password_changed_at)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    " role, is_admin, legacy_hash, password_changed_at, flags_tag)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (username, salt, verify_hash, ARGON2_TIME_COST, ARGON2_MEMORY_COST,
                      ARGON2_PARALLELISM, fields_text, fields_enc, 1 if is_active else 0,
-                     now, now, role, 1 if is_admin else 0, legacy_hash, now)
+                     now, now, role, 1 if is_admin else 0, legacy_hash, now, flags_tag)
                 )
                 self._conn.commit()
             except sqlite3.IntegrityError:
@@ -723,35 +786,46 @@ class UserStore:
 
     def set_active(self, username: str, active: bool) -> bool:
         """Activate/deactivate (soft-delete) a user."""
-        username = normalize_username(username)
-        with self._lock:
-            cur = self._conn.execute(
-                "UPDATE users SET is_active = ?, updated_at = ? WHERE username = ?",
-                (1 if active else 0, _utcnow(), username)
-            )
-            self._conn.commit()
-            return cur.rowcount > 0
+        return self._set_flags(username, is_active=bool(active))
 
     def set_role(self, username: str, role: str) -> bool:
-        """Set the plaintext role label (queryable; not a secret)."""
+        """Set the plaintext role label (queryable; authenticated under fields_key)."""
         if not isinstance(role, str):
             raise AuthStoreError("role must be a string")
-        username = normalize_username(username)
-        with self._lock:
-            cur = self._conn.execute(
-                "UPDATE users SET role = ?, updated_at = ? WHERE username = ?",
-                (role, _utcnow(), username))
-            self._conn.commit()
-            return cur.rowcount > 0
+        return self._set_flags(username, role=role)
 
     def set_admin(self, username: str, is_admin: bool) -> bool:
+        return self._set_flags(username, is_admin=bool(is_admin))
+
+    def _set_flags(self, username: str, *, role: Optional[str] = None,
+                   is_admin: Optional[bool] = None,
+                   is_active: Optional[bool] = None) -> bool:
+        """Update typed flags and re-tag the row. False if the user is unknown.
+
+        The current values are read under the lock so the new tag covers
+        exactly what the row will hold. A row whose current tag no longer
+        verifies is not "repaired" here: an operator flipping one flag must
+        not silently launder a forged one.
+        """
         username = normalize_username(username)
         with self._lock:
-            cur = self._conn.execute(
-                "UPDATE users SET is_admin = ?, updated_at = ? WHERE username = ?",
-                (1 if is_admin else 0, _utcnow(), username))
+            row = self._row(username)
+            if row is None:
+                return False
+            self._check_flags(row)
+            new_role = role if role is not None else (
+                row['role'] if isinstance(row['role'], str) else '')
+            new_admin = is_admin if is_admin is not None else _is_truthy_active(row['is_admin'])
+            new_active = is_active if is_active is not None else \
+                _is_truthy_active(row['is_active'])
+            self._conn.execute(
+                "UPDATE users SET role = ?, is_admin = ?, is_active = ?, flags_tag = ?,"
+                " updated_at = ? WHERE username = ?",
+                (new_role, 1 if new_admin else 0, 1 if new_active else 0,
+                 self._flags_tag_for(username, new_role, new_admin, new_active),
+                 _utcnow(), username))
             self._conn.commit()
-            return cur.rowcount > 0
+            return True
 
     def deactivate(self, username: str) -> bool:
         return self.set_active(username, False)
@@ -780,6 +854,7 @@ class UserStore:
             row = self._row(username)
             if row is None:
                 return None
+            self._check_flags(row)
             return {
                 'username': row['username'],
                 'fields': self._decode_fields(row['fields'], row['fields_enc'],
@@ -880,6 +955,7 @@ class UserStore:
             return self._result(row)
 
     def _result(self, row: dict) -> AuthResult:
+        self._check_flags(row)
         return AuthResult(
             username=row['username'],
             fields=self._decode_fields(row['fields'], row['fields_enc'],

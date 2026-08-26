@@ -162,6 +162,16 @@ the `.v1-backup` file — it still contains the old plaintext metadata.
   database without the key cannot brute-force a 50-bit recovery code
   offline, nor mint a reset. A store created without `fields_key` cannot
   hold any of this; the policy is one-way, and `sofiavault doctor` warns.
+- **Typed flags are authenticated too.** `role`, `is_admin` and
+  `is_active` are plaintext columns so policy queries can filter on them,
+  but on a store that has `fields_key` each row also carries
+  `HMAC-SHA256(fields_key, username | role | is_admin | is_active)`, checked
+  whenever `verify()` or `get_user()` returns them. Setting `is_admin = 1`
+  with a SQL client — or reviving a deactivated account — surfaces as
+  `FieldsTampered`, exactly like a forged encrypted profile did in 0.3.0.
+  A store created *without* `fields_key` has no such tags: its flags are
+  as unauthenticated as the rest of its row, which is one more reason to
+  create stores with a key.
 - **TOTP replay is closed atomically.** The last accepted time-step is
   read, the code checked, and the step written inside one
   `BEGIN IMMEDIATE` transaction, so two submissions of the same code —

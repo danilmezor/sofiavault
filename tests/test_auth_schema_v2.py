@@ -155,3 +155,112 @@ def test_T_7_5_typed_flags_are_queryable_without_decrypting_fields():
     conn.commit()
     with UserStore(path, fields_key=KEY) as s:
         assert s.verify("bob", "pw-bob-1").is_admin is False
+
+
+# ── typed flags are tamper-evident under fields_key (security review fix) ──
+
+def _sql(path: Path, stmt: str, params=()):
+    conn = sqlite3.connect(str(path))
+    conn.execute(stmt, params)
+    conn.commit()
+    conn.close()
+
+
+def test_T_7_6_typed_flags_cannot_be_forged_by_writing_the_db():
+    path = Path(tempfile.mkdtemp()) / "users.db"
+    with UserStore(path, fields_key=KEY) as s:
+        s.add_user("mallory", "mallory-pw-1")
+        s.add_user("root", "root-pw-1")
+        s.set_admin("root", True)
+        s.set_role("root", "admin")
+        s.deactivate("mallory")
+        r = s.verify("root", "root-pw-1")
+        assert r.is_admin is True and r.role == "admin"
+        assert s.verify("mallory", "mallory-pw-1") is None
+    for stmt in ("UPDATE users SET is_admin = 1 WHERE username = 'mallory'",
+                 "UPDATE users SET role = 'admin' WHERE username = 'mallory'",
+                 "UPDATE users SET is_active = 1 WHERE username = 'mallory'",
+                 "UPDATE users SET flags_tag = NULL WHERE username = 'mallory'"):
+        before = path.read_bytes()
+        _sql(path, "UPDATE users SET is_active = 1 WHERE username = 'mallory'")
+        _sql(path, stmt)
+        with UserStore(path, fields_key=KEY) as s:
+            with pytest.raises(FieldsTampered):
+                s.verify("mallory", "mallory-pw-1")
+            with pytest.raises(FieldsTampered):
+                s.get_user("mallory")
+            # the untouched user is unaffected
+            assert s.verify("root", "root-pw-1").is_admin is True
+        path.write_bytes(before)
+    # a legitimate change through the API re-tags and verifies
+    with UserStore(path, fields_key=KEY) as s:
+        s.activate("mallory")
+        s.set_admin("mallory", True)
+        assert s.verify("mallory", "mallory-pw-1").is_admin is True
+        s.set_admin("mallory", False)
+        assert s.verify("mallory", "mallory-pw-1").is_admin is False
+
+
+def test_T_7_7_flag_tags_are_bound_to_the_user_and_absent_without_a_key():
+    path = Path(tempfile.mkdtemp()) / "users.db"
+    with UserStore(path, fields_key=KEY) as s:
+        s.add_user("root", "root-pw-1")
+        s.set_admin("root", True)
+        s.add_user("mallory", "mallory-pw-1")
+    conn = sqlite3.connect(str(path))
+    root_tag = conn.execute("SELECT flags_tag FROM users WHERE username='root'").fetchone()[0]
+    assert isinstance(root_tag, bytes) and len(root_tag) == 32
+    conn.execute("UPDATE users SET is_admin = 1, flags_tag = ? WHERE username = 'mallory'",
+                 (root_tag,))
+    conn.commit()
+    conn.close()
+    with UserStore(path, fields_key=KEY) as s:
+        with pytest.raises(FieldsTampered):
+            s.verify("mallory", "mallory-pw-1")
+        assert s.list_users(admin_only=True) == ["mallory", "root"]   # index only
+    # a different key cannot produce a tag that verifies
+    with UserStore(path, fields_key=bytes(32)) as other, pytest.raises(FieldsTampered):
+        other.verify("root", "root-pw-1")
+    # a store without a key has no tags and no check (documented)
+    plain = Path(tempfile.mkdtemp()) / "plain.db"
+    with UserStore(plain) as s:
+        s.add_user("alice", "alice-pw-1")
+        s.set_admin("alice", True)
+    assert sqlite3.connect(str(plain)).execute(
+        "SELECT flags_tag FROM users").fetchone()[0] is None
+    with UserStore(plain) as s:
+        assert s.verify("alice", "alice-pw-1").is_admin is True
+
+
+def _make_v1_encrypted_store(d: Path) -> Path:
+    """A 0.3.0-shaped store that encrypts fields, built by stripping v2."""
+    path = d / "users.db"
+    with UserStore(path, fields_key=KEY) as s:
+        s.add_user("alice", "alice-pw-1", team="ops")
+        s.deactivate("alice")
+        s.activate("alice")
+    conn = sqlite3.connect(str(path))
+    for name, _ in auth._V2_COLUMNS:
+        conn.execute(f"ALTER TABLE users DROP COLUMN {name}")
+    conn.execute("DROP TABLE reset_tokens")
+    conn.execute("UPDATE auth_meta SET value = '1' WHERE key = 'schema_version'")
+    conn.commit()
+    conn.close()
+    return path
+
+
+def test_v1_encrypting_store_migration_tags_rows_and_needs_the_key():
+    d = Path(tempfile.mkdtemp())
+    path = _make_v1_encrypted_store(d)
+    with pytest.raises(AuthStoreError, match="fields_key"):
+        UserStore(path)                       # cannot tag rows without the key
+    assert sqlite3.connect(str(path)).execute(
+        "SELECT value FROM auth_meta WHERE key='schema_version'").fetchone()[0] == "1"
+    with UserStore(path, fields_key=KEY) as s:
+        r = s.verify("alice", "alice-pw-1")
+        assert r is not None and r.fields == {"team": "ops"} and r.is_admin is False
+    tag = sqlite3.connect(str(path)).execute("SELECT flags_tag FROM users").fetchone()[0]
+    assert isinstance(tag, bytes) and len(tag) == 32
+    # ...and once migrated, the keyless open works for index queries again
+    with UserStore(path) as s:
+        assert s.list_users() == ["alice"]
