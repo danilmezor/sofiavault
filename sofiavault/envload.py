@@ -33,17 +33,26 @@ Two gates, in order of preference:
    exhaustive — every new tool ships new variables. Treat it as a safety
    net for development, not as the control you rely on in production.
 
-`allow_unsafe_names=True` disables gate 2; it has no effect on gate 1,
-since an explicit allowlist is already the stronger statement.
+The allowlist narrows, it never widens: a denylisted name that is *also*
+allowlisted still raises unless `allow_unsafe_names=True`. That flag disables
+gate 2 for names the allowlist admits (or, without an allowlist, for every
+name); names outside the allowlist are never injected under any flag.
+
+The allowlist can live in a file — one name per line, `#` comments — shared
+by the CLI (`sofiavault run --allow FILE`) and the library
+(`load(allow_file=FILE)`), or configured once via `SOFIAVAULT_ALLOW_FILE`.
+`load()` returns a LoadReport that still unpacks as `(injected, skipped)`.
 """
 
 import os
 import re
 import shutil
 from collections.abc import Iterable
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Union
 
+from . import paths
 from .vault import Vault, VaultCorrupted
 
 ENV_PREFIX = "env:"
@@ -157,6 +166,92 @@ class UnsafeVariableName(ValueError):
     """A variable name is malformed or is a loader/interpreter variable."""
 
 
+class AllowListError(ValueError):
+    """An allowlist file is configured but unusable (missing, empty, malformed).
+
+    Fails closed on purpose: a silently empty allowlist would inject nothing
+    and the application would boot without its secrets, failing far from
+    the cause.
+    """
+
+
+class AllowList(frozenset):
+    """Upper-cased variable names from an allowlist file; `.path` records where."""
+
+    path: Optional[Path]
+
+    def __new__(cls, names: Iterable[str], path: Optional[Path] = None):
+        obj = super().__new__(cls, names)
+        obj.path = Path(path) if path is not None else None
+        return obj
+
+
+@dataclass
+class LoadReport:
+    """What load() did. Unpacks as the 0.3.0 `(injected, skipped)` pair.
+
+    injected  names set in the environment
+    skipped   names left alone because the environment already had them
+    denied    safe names present in the vault but excluded by the allowlist,
+              mapped to a reason — an operator can tell "the vault has it
+              but policy blocked it" from "the vault lacks it"
+    """
+
+    injected: list = field(default_factory=list)
+    skipped: list = field(default_factory=list)
+    denied: dict = field(default_factory=dict)
+    vault_path: Optional[Path] = None
+
+    def __iter__(self):
+        yield self.injected
+        yield self.skipped
+
+    def __eq__(self, other):
+        if isinstance(other, tuple):
+            return (self.injected, self.skipped) == other
+        return NotImplemented
+
+
+def load_allowlist(path: Union[str, Path]) -> AllowList:
+    """Parse an allowlist file: one name per line, `#` comments, blanks ignored.
+
+    Raises AllowListError if the file cannot be read, is empty, or contains
+    a malformed name — never returns an empty set.
+    """
+    path = Path(path)
+    try:
+        text = path.read_text(encoding='utf-8')
+    except (OSError, UnicodeDecodeError) as exc:
+        raise AllowListError(f"cannot read allowlist {path}: {exc}") from exc
+    names = set()
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        line = raw.split('#', 1)[0].strip()
+        if not line:
+            continue
+        if not VALID_NAME.match(line):
+            raise AllowListError(
+                f"{path}:{lineno}: not a valid environment variable name: {line!r}"
+            )
+        names.add(line.upper())
+    if not names:
+        raise AllowListError(f"allowlist {path} names no variables")
+    return AllowList(names, path)
+
+
+def _resolve_allow(allow: Optional[Iterable[str]],
+                   allow_file: Union[str, Path, None]) -> Optional[set]:
+    """Pick the allowlist in force: explicit list, explicit file, env default, none."""
+    if allow is not None and allow_file is not None:
+        raise ValueError("pass allow= or allow_file=, not both")
+    if allow is not None:
+        return _normalize_allow(allow)
+    if allow_file is not None:
+        return load_allowlist(allow_file)
+    if paths.ALLOW_FILE is not None:
+        return load_allowlist(paths.ALLOW_FILE)
+    return None
+
+
 class MalformedEnvFile(ValueError):
     """A .env file could not be parsed unambiguously.
 
@@ -175,7 +270,7 @@ def is_safe_name(name: str) -> bool:
     if not isinstance(name, str) or not VALID_NAME.match(name):
         return False
     upper = name.upper()
-    if upper in UNSAFE_NAMES:
+    if upper in UNSAFE_NAMES or upper in BOOTSTRAP_VARS:
         return False
     if any(upper.startswith(p) for p in UNSAFE_PREFIXES):
         return False
@@ -215,29 +310,32 @@ def _entry_names(vault: Vault) -> list[tuple[str, str]]:
 
 def load(path: Union[str, Path, None] = None, *, vault: Optional[Vault] = None,
          allow: Optional[Iterable[str]] = None,
+         allow_file: Union[str, Path, None] = None,
          overwrite: bool = False, environ: Optional[dict] = None,
          allow_unsafe_names: bool = False,
-         allow_corrupt: bool = False) -> tuple[list[str], list[str]]:
+         allow_corrupt: bool = False) -> LoadReport:
     """Inject all `env:*` entries into the environment.
 
     Provide either an already-open `vault=` or a `path` (unlocked via
     Vault.open_auto — raises VaultLocked if no key source is configured).
 
-    `allow` names the variables this application consumes; anything else in
-    the vault is refused. Strongly preferred over the default denylist —
-    see the module docstring.
+    `allow` names the variables this application consumes; `allow_file`
+    reads the same list from a file (see load_allowlist). Give at most one;
+    with neither, SOFIAVAULT_ALLOW_FILE is used if set, else the denylist.
+    Anything outside the allowlist is not injected. Strongly preferred over
+    the default denylist — see the module docstring.
 
-    Returns `(injected, skipped)`: names that were set, and names that were
-    left alone because the environment already defined them. Callers that
-    care about ambient overrides can log or reject on a non-empty `skipped`.
+    Returns a LoadReport (`injected`, `skipped`, `denied`, `vault_path`)
+    which still unpacks as the 0.3.0 `(injected, skipped)` pair.
 
-    Raises UnsafeVariableName for malformed, denied, or non-allowlisted
-    names, and VaultCorrupted if the vault failed authenticated decryption
-    or its entry set does not match its MAC. Validation happens up front,
-    so injection is all-or-nothing.
+    Raises UnsafeVariableName for malformed or denylisted names,
+    AllowListError for a configured-but-unusable allowlist file, and
+    VaultCorrupted if the vault failed authenticated decryption or its entry
+    set does not match its MAC. Validation happens up front, so injection
+    is all-or-nothing.
     """
     env = environ if environ is not None else os.environ
-    allowed = _normalize_allow(allow)
+    allowed = _resolve_allow(allow, allow_file)
     own = False
     v = vault
     if v is None:
@@ -266,6 +364,7 @@ def load(path: Union[str, Path, None] = None, *, vault: Optional[Vault] = None,
             )
 
         pairs = _entry_names(v)
+        denied: dict = {}
 
         if allowed is not None:
             # Names outside the allowlist are simply not injected, so a vault
@@ -279,7 +378,16 @@ def load(path: Union[str, Path, None] = None, *, vault: Optional[Vault] = None,
                     "vault contains unsafe variable name(s) outside the "
                     "allowlist: " + ", ".join(bad)
                 )
+            for name in ignored:
+                denied[name] = "not in allowlist"
             pairs = [(s, name) for s, name in pairs if name.upper() in allowed]
+            # The allowlist narrows; it never admits a loader variable.
+            bad = sorted({name for _s, name in pairs if not is_safe_name(name)})
+            if bad and not allow_unsafe_names:
+                raise UnsafeVariableName(
+                    "allowlist admits unsafe variable name(s): " + ", ".join(bad)
+                    + " (pass allow_unsafe_names=True to inject them anyway)"
+                )
         else:
             bad = sorted({name for _s, name in pairs
                           if not (allow_unsafe_names or is_safe_name(name))})
@@ -315,7 +423,8 @@ def load(path: Union[str, Path, None] = None, *, vault: Optional[Vault] = None,
     finally:
         if own:
             v.close()
-    return sorted(injected), sorted(skipped)
+    return LoadReport(sorted(injected), sorted(skipped), dict(sorted(denied.items())),
+                      Path(v.path) if getattr(v, 'path', None) is not None else None)
 
 
 def _without_trailing_comment(text: str) -> str:
@@ -486,6 +595,7 @@ def list_env_entries(vault: Vault) -> list[str]:
 
 def exec_with_env(vault: Vault, argv: list[str], *,
                   allow: Optional[Iterable[str]] = None,
+                  allow_file: Union[str, Path, None] = None,
                   allow_unsafe_names: bool = False) -> "None":
     """Inject env:* entries, close the vault, then exec the command.
 
@@ -508,7 +618,7 @@ def exec_with_env(vault: Vault, argv: list[str], *,
         raise FileNotFoundError(f"command not found on PATH: {program}")
 
     try:
-        load(vault=vault, environ=os.environ, allow=allow,
+        load(vault=vault, environ=os.environ, allow=allow, allow_file=allow_file,
              allow_unsafe_names=allow_unsafe_names)
     finally:
         # A validation failure must still drop the key rather than leave the
