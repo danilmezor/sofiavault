@@ -20,7 +20,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from . import __version__, envload, paths
+from . import __version__, cli_server, envload, paths
 from .auth import AuthStoreError, UserStore
 from .core import create_master_record, verify_master_password
 from .generator import (
@@ -1569,12 +1569,22 @@ def print_oneshot_help():
     print()
     print(f"  {style('Server / library', C.BOLD)}")
     print(f"  {style(_hr(), C.DIM)}")
+    print(f"  sofiavault {style('env set', C.CYAN)} {style('NAME < value', C.DIM)}  "
+          f"{style('Store a secret (stdin, --from-file, --value)', C.DIM)}")
+    print(f"  sofiavault {style('env get|del', C.CYAN)} {style('NAME', C.DIM)}     "
+          f"{style('Read / remove one secret', C.DIM)}")
     print(f"  sofiavault {style('env import', C.CYAN)} {style('<.env>', C.DIM)}    "
           f"{style('Store dotenv secrets as env:* entries', C.DIM)}")
+    print(f"  sofiavault {style('env export', C.CYAN)} {style('--allow F', C.DIM)} "
+          f"{style('Dump allowlisted secrets (dotenv/json)', C.DIM)}")
     print(f"  sofiavault {style('env list', C.CYAN)}             "
           f"{style('List injectable env vars', C.DIM)}")
-    print(f"  sofiavault {style('run', C.CYAN)} {style('-- <cmd>', C.DIM)}         "
+    print(f"  sofiavault {style('run', C.CYAN)} {style('--allow F -- <cmd>', C.DIM)} "
           f"{style('Exec a command with env:* injected', C.DIM)}")
+    print(f"  sofiavault {style('rekey', C.CYAN)} {style('[--key-file P]', C.DIM)} "
+          f"{style('Rotate the master key', C.DIM)}")
+    print(f"  sofiavault {style('doctor', C.CYAN)}               "
+          f"{style('Check a deployment would boot', C.DIM)}")
     print(f"  sofiavault {style('auth import', C.CYAN)} {style('<json>', C.DIM)}   "
           f"{style('Build a verify-only user store', C.DIM)}")
     print(f"  sofiavault {style('key', C.CYAN)}                  "
@@ -1588,7 +1598,10 @@ def print_oneshot_help():
     print(f"  sofiavault amazn            "
           f"{style(fuzzy_desc, C.DIM)}")
     print("  sofiavault import ~/passwords.csv")
-    print("  sofiavault run -- uvicorn app:main")
+    print("  sofiavault run --allow secrets.allow -- uvicorn app:main")
+    print("  echo \"$TOKEN\" | sofiavault env set API_TOKEN --vault /srv/app/secrets.db")
+    print(f"  {style('All env/run/rekey/doctor commands take --vault PATH', C.DIM)}")
+    print(f"  {style('(default: $SOFIAVAULT_DB) and add --help for details.', C.DIM)}")
     print()
 
 
@@ -1855,9 +1868,11 @@ def _run_oneshot(args: list[str]):
     command = args[0].lower()
 
     # Commands that must not (or need not) unlock the local vault first
-    if command == 'run':
-        cmd_run(args[1:])
-        return
+    if command in cli_server.SERVER_COMMANDS:
+        # Non-interactive server commands: explicit --vault, open_auto
+        # unlock chain, exit codes. `env import`/`env list` keep their 0.3.0
+        # meaning; they simply no longer prompt when stdin is not a TTY.
+        sys.exit(cli_server.main(args))
     if command == 'auth':
         cmd_auth(args[1:])
         return

@@ -588,6 +588,53 @@ def import_env_file(vault: Vault, env_path: Union[str, Path],
     return imported, skipped, rejected
 
 
+class ExportError(ValueError):
+    """A value cannot be written in dotenv form so that it reads back intact."""
+
+
+def _dotenv_line(name: str, value: str) -> str:
+    """One `NAME="value"` line (or block) that _iter_env_pairs reads back as-is.
+
+    The format has no escaping, so instead of predicting its two documented
+    ambiguities the candidate is parsed back and checked; double quotes are
+    tried first, then single. ExportError if neither survives — use JSON.
+    """
+    for quote in ('"', "'"):
+        candidate = f"{name}={quote}{value}{quote}"
+        pairs = list(_iter_env_pairs(candidate + "\nSOFIAVAULT_SENTINEL=1\n"))
+        if pairs == [(name, value), ("SOFIAVAULT_SENTINEL", "1")]:
+            return candidate
+    raise ExportError(
+        f"{name}: value cannot be represented in dotenv form without loss "
+        "(a line ends in a quote character or the first line has trailing "
+        "whitespace); export with --format json instead"
+    )
+
+
+def export_env(vault: Vault, allow: Optional[Iterable[str]] = None, *,
+               allow_file: Union[str, Path, None] = None,
+               fmt: str = "dotenv") -> str:
+    """Plaintext dump of the allowlisted env:* entries, for rotation/migration.
+
+    An allowlist is REQUIRED (list or file): a full dump must be a deliberate
+    act, never the default. `fmt` is "dotenv" (round-trips through
+    import_env_file) or "json" (an object, lossless for any value).
+    """
+    if allow is None and allow_file is None:
+        raise ValueError("export_env requires allow= or allow_file=")
+    allowed = _resolve_allow(allow, allow_file)
+    values = {}
+    for service, name in _entry_names(vault):
+        if name.upper() in allowed:
+            values[name] = vault.get(service)
+    if fmt == "json":
+        import json
+        return json.dumps(dict(sorted(values.items())), ensure_ascii=False, indent=2) + "\n"
+    if fmt != "dotenv":
+        raise ValueError(f"unknown format: {fmt}")
+    return "".join(_dotenv_line(n, v) + "\n" for n, v in sorted(values.items()))
+
+
 def list_env_entries(vault: Vault) -> list[str]:
     """Names of the environment variables the vault would inject."""
     return sorted(name for _service, name in _entry_names(vault))
