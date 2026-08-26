@@ -24,6 +24,7 @@ __all__ = [
     "Vault", "Entry", "VaultEntry",
     "VaultError", "VaultLocked", "VaultCorrupted", "WrongPassword",
     "EntryNotFound", "VaultNotInitialized", "VaultAlreadyInitialized",
+    "VaultReadOnly",
     # auth
     "UserStore", "AuthResult", "AuthStoreError", "InvalidUsername",
     "normalize_username",
@@ -145,6 +146,7 @@ from .vault import (  # noqa: F401
     VaultError,
     VaultLocked,
     VaultNotInitialized,
+    VaultReadOnly,
     WrongPassword,
 )
 

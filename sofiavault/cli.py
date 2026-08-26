@@ -40,6 +40,7 @@ from .storage import (
     entry_row_exists,
     fuzzy_find_service,
     get_entry_by_service,
+    get_master_costs,
     get_master_data,
     get_password,
     init_db,
@@ -47,6 +48,7 @@ from .storage import (
     load_entries,
     migrate_legacy_vault,
     migrate_v2_to_v3,
+    migrate_v3_to_v4,
     save_entry,
     save_master,
     update_entry,
@@ -663,7 +665,8 @@ def cmd_import_vault(src: str) -> bool:
     ro = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     try:
         combined_salt, stored_hash = get_master_data(ro)
-        key = verify_master_password(password, combined_salt, stored_hash)
+        key = verify_master_password(password, combined_salt, stored_hash,
+                                     costs=get_master_costs(ro))
     finally:
         ro.close()
     if key is None:
@@ -847,7 +850,8 @@ def setup_master(conn: sqlite3.Connection) -> bytes:
 def _key_from_password(conn: sqlite3.Connection, password: str) -> Optional[bytes]:
     """Derive and verify the master key. Returns None on wrong password."""
     combined_salt, stored_hash = get_master_data(conn)
-    return verify_master_password(password, combined_salt, stored_hash)
+    return verify_master_password(password, combined_salt, stored_hash,
+                                  costs=get_master_costs(conn))
 
 
 def unlock_vault(conn: sqlite3.Connection) -> Optional[bytes]:
@@ -1786,6 +1790,8 @@ def _open_vault(show_banner_on_setup: bool) -> tuple[sqlite3.Connection, bytes]:
     upgraded = migrate_v2_to_v3(conn, key)
     if upgraded:
         print_info(f"Upgraded {upgraded} entries to the tamper-evident format.")
+    # v4: persist the master record's Argon2 costs and cover it with the MAC.
+    migrate_v3_to_v4(conn, key)
     if result.total:
         if result.failed:
             print_warn(f"Migrated {result.migrated}/{result.total} entries. "

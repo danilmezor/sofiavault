@@ -63,7 +63,7 @@ def test_cli_opens_v2_vault_without_losing_entries():
 
     assert sorted(e.service for e in session.entries) == ["bank", "github"]
     assert session.corrupt_count == 0
-    assert storage.get_schema_version(conn) == 3
+    assert storage.get_schema_version(conn) == storage.SCHEMA_VERSION
     by_name = {e.service: e.id for e in session.entries}
     assert storage.get_password(conn, key, by_name["github"]) == "gh-secret"
     assert storage.get_password(conn, key, by_name["bank"]) == "bank-secret"
@@ -149,7 +149,7 @@ def test_cli_opens_v1_vault_without_losing_entries():
 
     assert sorted(e.service for e in session.entries) == ["bank", "github"]
     assert session.corrupt_count == 0
-    assert storage.get_schema_version(conn) == 3
+    assert storage.get_schema_version(conn) == storage.SCHEMA_VERSION
     assert storage.verify_entries_mac(conn, key) is True
     by_name = {e.service: e.id for e in session.entries}
     assert storage.get_password(conn, key, by_name["github"]) == "gh-secret"

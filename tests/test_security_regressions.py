@@ -25,7 +25,7 @@ from sofiavault.auth import (
 )
 from sofiavault.core import ARGON2_MEMORY_COST, ARGON2_TIME_COST
 from sofiavault.envload import UnsafeVariableName, is_safe_name
-from sofiavault.storage import get_schema_version
+from sofiavault.storage import SCHEMA_VERSION, get_schema_version
 from sofiavault.vault import Vault, VaultCorrupted
 
 PW = "regression-test-pw"
@@ -222,7 +222,7 @@ def test_h3_cross_vault_transplant_is_rejected():
 
 def test_h3_new_vaults_are_schema_v3():
     v, path = _vault()
-    assert get_schema_version(v._conn) == 3
+    assert get_schema_version(v._conn) == SCHEMA_VERSION
     v.close()
 
 
@@ -257,7 +257,7 @@ def test_h3_v2_vault_upgrades_transparently():
     v2 = Vault.open(path, password=PW)
     assert v2.corrupt_count == 0
     assert v2.get("legacy") == "legacy-secret"    # migrated, not lost
-    assert get_schema_version(v2._conn) == 3
+    assert get_schema_version(v2._conn) == SCHEMA_VERSION
     v2.close()
 
     v3 = Vault.open(path, password=PW)            # and it stays readable
@@ -693,7 +693,7 @@ def test_h6_rollback_plus_mac_delete_plus_version_rollback_is_detected():
 
     # The real schema_version is restored and the tampered set is never
     # re-signed, so a second open reaches the same verdict.
-    assert get_schema_version(Vault.open(path, password=PW)._conn) == 3
+    assert get_schema_version(Vault.open(path, password=PW)._conn) == SCHEMA_VERSION
     v = Vault.open(path, password=PW)
     assert v.tampered
     v.close()

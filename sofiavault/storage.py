@@ -21,11 +21,40 @@ from typing import Callable, Optional
 from rapidfuzz import fuzz, process
 
 from . import paths
-from .core import ENTRY_CONTEXT, SALT_SIZE, decrypt, derive_entry_key, derive_key, encrypt
+from .core import (
+    ARGON2_MEMORY_COST,
+    ARGON2_PARALLELISM,
+    ARGON2_TIME_COST,
+    ENTRY_CONTEXT,
+    SALT_SIZE,
+    decrypt,
+    derive_entry_key,
+    derive_key,
+    encrypt,
+)
 
-#: Bumped when the on-disk entry format changes. v3 binds each entry blob
-#: to its row id and vault id via AES-GCM associated data.
-SCHEMA_VERSION = 3
+#: Bumped when the on-disk format changes. v3 binds each entry blob to its
+#: row id and vault id via AES-GCM associated data. v4 persists the master
+#: record's Argon2 cost parameters and covers the master row with the
+#: entry-set MAC.
+SCHEMA_VERSION = 4
+
+#: Columns added to `master` by schema v4. Nullable so a v3 row can be
+#: adopted in place; NULL means "the constants this build was compiled with".
+_MASTER_COST_COLUMNS = ('time_cost', 'memory_cost', 'parallelism')
+
+
+class ReadOnlyDatabase(Exception):
+    """Raised by the storage layer when the vault file cannot be written.
+
+    Vault translates this into the typed VaultReadOnly; kept separate so the
+    storage module stays free of the vault module's exception hierarchy.
+    """
+
+
+def _is_readonly_error(exc: sqlite3.Error) -> bool:
+    msg = str(exc).lower()
+    return 'readonly' in msg or 'read-only' in msg
 
 
 def _harden_storage_perms(db_path: Path):
@@ -66,29 +95,66 @@ def _create_private_file(path: Path):
     os.close(fd)
 
 
-def init_db(db_path: Optional[Path] = None,
-            check_same_thread: bool = True) -> sqlite3.Connection:
-    """Initialize database and return connection.
+def _db_uri(db_path: Path, mode: str) -> str:
+    """A `file:` URI for sqlite, with `?`/`#` in the path percent-encoded."""
+    return f"{db_path.resolve().as_uri()}?mode={mode}"
 
-    `check_same_thread=False` is used by the library Vault, which serializes
-    all access behind its own lock so a single instance can be shared by a
-    threaded server.
+
+def connect_db(db_path: Optional[Path] = None, *, readonly: bool = False,
+               check_same_thread: bool = True) -> sqlite3.Connection:
+    """Open a connection without touching the file's contents.
+
+    `readonly=True` opens with `?mode=ro`: nothing is created, chmod-ed, or
+    written, so a vault on a read-only bind mount is usable as-is. The
+    writable path assumes ensure_schema() runs next.
     """
     db_path = Path(db_path) if db_path is not None else paths.DB_PATH
-    db_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    _create_private_file(db_path)
-    _harden_storage_perms(db_path)
-    conn = sqlite3.connect(str(db_path), check_same_thread=check_same_thread)
+    if readonly:
+        try:
+            conn = sqlite3.connect(_db_uri(db_path, 'ro'), uri=True,
+                                   check_same_thread=check_same_thread)
+        except sqlite3.OperationalError as exc:
+            raise FileNotFoundError(f"cannot open {db_path} read-only: {exc}") from exc
+    else:
+        conn = sqlite3.connect(str(db_path), check_same_thread=check_same_thread)
     # Overwrite deleted content with zeros so removed entries (and migrated
     # legacy plaintext) don't linger in the database file's free pages.
     conn.execute("PRAGMA secure_delete = ON")
+    return conn
+
+
+def ensure_schema(conn: sqlite3.Connection, db_path: Path):
+    """Create missing tables, adopt older layouts, stamp a fresh database.
+
+    Everything here writes; a read-only file surfaces as ReadOnlyDatabase so
+    the caller can turn it into a typed error instead of a raw sqlite one.
+    """
+    try:
+        _ensure_schema(conn)
+    except sqlite3.OperationalError as exc:
+        if _is_readonly_error(exc):
+            raise ReadOnlyDatabase(f"{db_path} is read-only: {exc}") from exc
+        raise
+    _harden_storage_perms(db_path)
+
+
+def _ensure_schema(conn: sqlite3.Connection):
     conn.execute("""
         CREATE TABLE IF NOT EXISTS master (
             id INTEGER PRIMARY KEY CHECK (id = 1),
             salt BLOB NOT NULL,
-            verify_hash BLOB NOT NULL
+            verify_hash BLOB NOT NULL,
+            time_cost INTEGER,
+            memory_cost INTEGER,
+            parallelism INTEGER
         )
     """)
+    # A pre-v4 master table lacks the cost columns; adding them is safe on
+    # any version (NULL keeps the constants in force until v4 stamps them).
+    have = {row[1] for row in conn.execute("PRAGMA table_info(master)")}
+    for column in _MASTER_COST_COLUMNS:
+        if column not in have:
+            conn.execute(f"ALTER TABLE master ADD COLUMN {column} INTEGER")
     # v2 entries: all fields (service, username, url, password, created_at)
     # live inside one authenticated AES-GCM blob. No plaintext metadata,
     # and nothing an attacker can relabel or swap between rows.
@@ -132,7 +198,26 @@ def init_db(db_path: Optional[Path] = None,
         )
     _ensure_vault_id(conn)
     conn.commit()
+
+
+def init_db(db_path: Optional[Path] = None,
+            check_same_thread: bool = True) -> sqlite3.Connection:
+    """Create/open a writable vault database and return the connection.
+
+    connect_db() + ensure_schema(). `check_same_thread=False` is used by
+    the library Vault, which serializes all access behind its own lock so a
+    single instance can be shared by a threaded server.
+    """
+    db_path = Path(db_path) if db_path is not None else paths.DB_PATH
+    db_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    _create_private_file(db_path)
     _harden_storage_perms(db_path)
+    conn = connect_db(db_path, check_same_thread=check_same_thread)
+    try:
+        ensure_schema(conn, db_path)
+    except BaseException:
+        conn.close()
+        raise
     return conn
 
 
@@ -203,6 +288,18 @@ def _entries_mac(conn: sqlite3.Connection, key: bytes) -> bytes:
     # crash. UTF-8 folds any such value into the digest instead, so a changed
     # vault_id simply fails the MAC like every other edit to it.
     h.update(b"vault=%s;" % _read_vault_id(conn).encode('utf-8'))
+    if get_schema_version(conn) >= 4:
+        # The master row decides how the key is derived. Its salt and cost
+        # parameters are plain columns; without this an attacker could swap
+        # in a salt/cost pair of their choosing (or roll a rekey back) and the
+        # entry set would still verify.
+        row = conn.execute(
+            "SELECT salt, time_cost, memory_cost, parallelism FROM master WHERE id = 1"
+        ).fetchone()
+        if row is not None:
+            h.update(b"master=")
+            h.update(bytes(row[0]) if row[0] is not None else b"")
+            h.update(b";costs=%s;" % ",".join(str(c) for c in row[1:]).encode('ascii'))
     for row_id, nonce in conn.execute(
             "SELECT id, nonce FROM entries_v2 ORDER BY id"):
         h.update(b"%d:" % row_id)
@@ -264,21 +361,35 @@ def is_vault_initialized(conn: sqlite3.Connection) -> bool:
 
 
 def save_master(conn: sqlite3.Connection, salt: bytes, verify_hash: bytes,
-                key: Optional[bytes] = None):
+                key: Optional[bytes] = None,
+                costs: Optional[tuple[int, int, int]] = None,
+                commit: bool = True):
     """Save master password verification data.
 
     Pass `key` when initializing a new vault so the entry-set MAC exists
     from the very first moment. A v3 vault is required to carry a MAC, so
     one that reaches disk without it cannot be told apart from one whose
     MAC an attacker deleted.
+
+    `costs` are the Argon2 parameters the record was derived with; they are
+    persisted (v4) so raising the build's constants later never bricks an
+    existing vault. None stamps the current constants.
     """
+    time_cost, memory_cost, parallelism = costs if costs is not None else default_costs()
     conn.execute(
-        "INSERT OR REPLACE INTO master (id, salt, verify_hash) VALUES (1, ?, ?)",
-        (salt, verify_hash)
+        "INSERT OR REPLACE INTO master (id, salt, verify_hash, time_cost, memory_cost, "
+        "parallelism) VALUES (1, ?, ?, ?, ?, ?)",
+        (salt, verify_hash, time_cost, memory_cost, parallelism)
     )
     if key is not None:
         refresh_entries_mac(conn, key, commit=False)
-    conn.commit()
+    if commit:
+        conn.commit()
+
+
+def default_costs() -> tuple[int, int, int]:
+    """The Argon2 parameters this build derives new master records with."""
+    return ARGON2_TIME_COST, ARGON2_MEMORY_COST, ARGON2_PARALLELISM
 
 
 def get_master_data(conn: sqlite3.Connection) -> tuple[bytes, bytes]:
@@ -286,6 +397,32 @@ def get_master_data(conn: sqlite3.Connection) -> tuple[bytes, bytes]:
     cur = conn.execute("SELECT salt, verify_hash FROM master WHERE id = 1")
     row = cur.fetchone()
     return row[0], row[1]
+
+
+def get_master_costs(conn: sqlite3.Connection) -> tuple[int, int, int]:
+    """Argon2 parameters for the master record.
+
+    A pre-v4 row (or one with NULL columns) was derived with the constants of
+    the build that wrote it, which every 0.x build shares; those are returned
+    so the row keeps opening after the constants change in a later release
+    — v4 stamps them explicitly at migration.
+    """
+    have = {r[1] for r in conn.execute("PRAGMA table_info(master)")}
+    if not all(c in have for c in _MASTER_COST_COLUMNS):
+        return default_costs()  # pre-v4 table opened read-only
+    cur = conn.execute(
+        "SELECT time_cost, memory_cost, parallelism FROM master WHERE id = 1"
+    )
+    row = cur.fetchone()
+    if row is None or any(c is None for c in row):
+        return default_costs()
+    try:
+        costs = tuple(int(c) for c in row)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"master cost parameters are malformed: {row!r}") from exc
+    if any(c < 1 for c in costs):
+        raise ValueError(f"master cost parameters are out of range: {costs!r}")
+    return costs  # type: ignore[return-value]
 
 
 @dataclass
@@ -600,6 +737,85 @@ def migrate_v2_to_v3(conn: sqlite3.Connection, key: bytes) -> int:
         conn.rollback()
         raise
     return upgraded
+
+
+def migrate_v3_to_v4(conn: sqlite3.Connection, key: bytes) -> bool:
+    """Stamp the master record's Argon2 costs and cover it with the MAC.
+
+    Returns True if the vault was upgraded. Refuses when the v3 entry set
+    does not verify: re-signing here would launder whatever the rows hold
+    into a valid v4 MAC, exactly as migrate_v2_to_v3 refuses for the same
+    reason. A refused vault stays v3 and surfaces as tampered.
+    """
+    if get_schema_version(conn) >= 4:
+        return False
+    if get_schema_version(conn) < 3:
+        return False  # not ours to adopt; migrate_v2_to_v3 runs first
+    if not verify_entries_mac(conn, key):
+        return False
+    try:
+        time_cost, memory_cost, parallelism = get_master_costs(conn)
+        conn.execute(
+            "UPDATE master SET time_cost = ?, memory_cost = ?, parallelism = ? "
+            "WHERE id = 1",
+            (time_cost, memory_cost, parallelism)
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO vault_meta (key, value) VALUES ('schema_version', ?)",
+            (str(SCHEMA_VERSION),)
+        )
+        refresh_entries_mac(conn, key, commit=False)
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    return True
+
+
+def rekey_vault(conn: sqlite3.Connection, old_key: bytes, new_key: bytes,
+                new_salt: bytes, new_verify_hash: bytes,
+                costs: tuple[int, int, int]) -> int:
+    """Re-encrypt every entry under `new_key` and replace the master record.
+
+    One transaction: either every row, the master record, and the MAC move
+    to the new key together, or nothing changes and `old_key` stays valid.
+    Any row that fails to decrypt aborts the whole operation — a rekey must
+    never launder a corrupt or tampered row into a freshly signed set.
+    Returns the number of entries re-encrypted.
+    """
+    vault_id = _ensure_vault_id(conn)
+    rows = conn.execute(
+        "SELECT id, salt, nonce, blob FROM entries_v2 ORDER BY id"
+    ).fetchall()
+    if not conn.in_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+    try:
+        for row_id, salt, nonce, blob in rows:
+            aad = _entry_aad(vault_id, row_id)
+            try:
+                payload = decrypt(nonce, blob, derive_entry_key(old_key, salt), aad=aad)
+            except Exception as exc:
+                raise ValueError(
+                    f"entry {row_id} failed authenticated decryption; refusing to rekey"
+                ) from exc
+            new_entry_salt = secrets.token_bytes(SALT_SIZE)
+            new_nonce, new_blob = encrypt(
+                payload, derive_entry_key(new_key, new_entry_salt), aad=aad
+            )
+            conn.execute(
+                "UPDATE entries_v2 SET salt = ?, nonce = ?, blob = ? WHERE id = ?",
+                (new_entry_salt, new_nonce, new_blob, row_id)
+            )
+        conn.execute(
+            "INSERT OR REPLACE INTO vault_meta (key, value) VALUES ('schema_version', ?)",
+            (str(SCHEMA_VERSION),)
+        )
+        save_master(conn, new_salt, new_verify_hash, new_key, costs=costs, commit=False)
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    return len(rows)
 
 
 def is_legacy_vault_file(db_path: Path) -> bool:

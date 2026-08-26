@@ -16,21 +16,30 @@ from typing import Optional, Union
 
 from .core import KEY_SIZE, verify_master_key, verify_master_password
 from .core import create_master_record as _create_master_record
+from .core import create_master_record_for_key as _create_master_record_for_key
 from .storage import (
     MigrationResult,
+    ReadOnlyDatabase,
     VaultEntry,
     _load_entry_payload,
+    _read_vault_id,
     backup_legacy_vault,
+    connect_db,
+    default_costs,
     delete_entry,
     entry_row_exists,
     fuzzy_find_service,
     get_entry_by_service,
+    get_master_costs,
     get_master_data,
+    get_schema_version,
     init_db,
     is_vault_initialized,
     load_entries,
     migrate_legacy_vault,
     migrate_v2_to_v3,
+    migrate_v3_to_v4,
+    rekey_vault,
     save_entry,
     save_master,
     update_entry,
@@ -60,6 +69,14 @@ class VaultLocked(VaultError):
 
 class EntryNotFound(VaultError, KeyError):
     """No entry with that service name."""
+
+
+class VaultReadOnly(VaultError):
+    """The vault file (or its directory) cannot be written.
+
+    Raised by open() on the writable path, and by every mutating method of a
+    vault opened with readonly=True.
+    """
 
 
 class VaultCorrupted(VaultError):
@@ -94,14 +111,17 @@ class Vault:
     """
 
     def __init__(self, conn: sqlite3.Connection, key: bytes, path: Path,
-                 migration: Optional[MigrationResult] = None):
+                 migration: Optional[MigrationResult] = None,
+                 readonly: bool = False):
         self._conn = conn
         self._key: Optional[bytes] = key
         self.path = path
         self.migration = migration
+        self.readonly = readonly
         self._entries: list[VaultEntry] = []
         self.corrupt_count = 0
         self.tampered = False
+        self._data_version: Optional[int] = None
         # Serializes access to the connection and the decrypted index so a
         # module-level Vault can be shared by a threaded server.
         self._lock = threading.RLock()
@@ -117,14 +137,22 @@ class Vault:
         if is_vault_initialized(conn):
             conn.close()
             raise VaultAlreadyInitialized(f"vault already initialized: {path}")
-        combined_salt, verify_hash, key = _create_master_record(password)
-        save_master(conn, combined_salt, verify_hash, key)
+        costs = default_costs()
+        combined_salt, verify_hash, key = _create_master_record(password, costs)
+        save_master(conn, combined_salt, verify_hash, key, costs=costs)
         return cls(conn, key, path)
 
     @classmethod
     def open(cls, path: Union[str, Path], password: Optional[str] = None,
-             key: Optional[bytes] = None) -> "Vault":
-        """Unlock an existing vault with an explicit password or raw key."""
+             key: Optional[bytes] = None, *, readonly: bool = False) -> "Vault":
+        """Unlock an existing vault with an explicit password or raw key.
+
+        `readonly=True` opens the file with sqlite's `mode=ro`: nothing is
+        created, migrated, or re-signed, so a vault on a read-only mount (the
+        natural Docker configuration) works as-is. Every mutating method then
+        raises VaultReadOnly. Without it, a vault that cannot be written
+        raises VaultReadOnly from here — never a raw sqlite error.
+        """
         if (password is None) == (key is None):
             raise ValueError("provide exactly one of password= or key=")
         path = Path(path)
@@ -133,23 +161,53 @@ class Vault:
         if key is not None and not isinstance(key, (bytes, bytearray)):
             raise WrongPassword("key must be bytes")
 
-        # Preserve a genuinely untouched copy before init_db() writes.
-        backup_legacy_vault(path)
-        conn = init_db(path, check_same_thread=False)
-        if not is_vault_initialized(conn):
-            conn.close()
-            raise VaultNotInitialized(f"vault has no master password: {path}")
+        if readonly:
+            try:
+                conn = connect_db(path, readonly=True, check_same_thread=False)
+            except (FileNotFoundError, sqlite3.Error) as exc:
+                raise VaultNotInitialized(f"cannot open {path}: {exc}") from exc
+            try:
+                if get_schema_version(conn) < 3:
+                    raise VaultReadOnly(
+                        f"{path} predates the tamper-evident format; open it "
+                        "writable once so it can be migrated"
+                    )
+                if not is_vault_initialized(conn):
+                    raise VaultNotInitialized(f"vault has no master password: {path}")
+                _read_vault_id(conn)
+            except VaultError:
+                conn.close()
+                raise
+            except Exception as exc:
+                conn.close()
+                raise VaultNotInitialized(f"{path} is not a vault: {exc}") from exc
+        else:
+            if not os.access(path, os.W_OK) or not os.access(path.parent, os.W_OK):
+                raise VaultReadOnly(
+                    f"{path} is not writable; pass readonly=True to open it anyway"
+                )
+            # Preserve a genuinely untouched copy before init_db() writes.
+            backup_legacy_vault(path)
+            try:
+                conn = init_db(path, check_same_thread=False)
+            except ReadOnlyDatabase as exc:
+                raise VaultReadOnly(str(exc)) from exc
+            if not is_vault_initialized(conn):
+                conn.close()
+                raise VaultNotInitialized(f"vault has no master password: {path}")
 
         try:
             combined_salt, stored_hash = get_master_data(conn)
+            costs = get_master_costs(conn)
             if password is not None:
-                master_key = verify_master_password(password, combined_salt, stored_hash)
+                master_key = verify_master_password(password, combined_salt,
+                                                    stored_hash, costs=costs)
                 if master_key is None:
                     raise WrongPassword("wrong master password")
             else:
                 if len(key) != KEY_SIZE:
                     raise WrongPassword(f"key must be {KEY_SIZE} bytes")
-                if not verify_master_key(key, combined_salt, stored_hash):
+                if not verify_master_key(key, combined_salt, stored_hash, costs=costs):
                     raise WrongPassword("key does not match this vault")
                 master_key = bytes(key)
         except VaultError:
@@ -167,12 +225,20 @@ class Vault:
         # library exception escaping open() would leave a live fd on a file we
         # already distrust.
         try:
+            if readonly:
+                return cls(conn, master_key, path, readonly=True)
             migration = migrate_legacy_vault(conn, master_key, path)
             migrate_v2_to_v3(conn, master_key)
+            migrate_v3_to_v4(conn, master_key)
             return cls(conn, master_key, path, migration=migration)
         except VaultError:
             conn.close()
             raise
+        except sqlite3.OperationalError as exc:
+            conn.close()
+            if 'readonly' in str(exc).lower():
+                raise VaultReadOnly(f"{path} is read-only: {exc}") from exc
+            raise VaultCorrupted(f"vault metadata is unreadable: {exc}") from exc
         except Exception as exc:
             conn.close()
             raise VaultCorrupted(f"vault metadata is unreadable: {exc}") from exc
@@ -252,6 +318,7 @@ class Vault:
         """
         with self._lock:
             self._require_unlocked()
+            self._sync()
             self._require_untampered()
             meta = get_entry_by_service(self._entries, service)
             if meta is None:
@@ -285,6 +352,8 @@ class Vault:
         """
         with self._lock:
             self._require_unlocked()
+            self._require_writable()
+            self._sync()
             self._require_untampered(live=True)
             existing = get_entry_by_service(self._entries, service)
             if existing is not None and not entry_row_exists(self._conn, existing.id):
@@ -315,6 +384,8 @@ class Vault:
         """
         with self._lock:
             self._require_unlocked()
+            self._require_writable()
+            self._sync()
             self._require_untampered(live=True)
             meta = get_entry_by_service(self._entries, service)
             if meta is None:
@@ -326,12 +397,14 @@ class Vault:
         """Decrypted metadata (service, username, url) — no passwords."""
         with self._lock:
             self._require_unlocked()
+            self._sync()
             return list(self._entries)
 
     def search(self, query: str, threshold: int = 60) -> list[tuple[VaultEntry, int]]:
         """Fuzzy-match services. Returns (entry, score) pairs, best first."""
         with self._lock:
             self._require_unlocked()
+            self._sync()
             return fuzzy_find_service(self._entries, query, threshold)
 
     # ── Key management / lifecycle ───────────────────────────────────────
@@ -344,6 +417,63 @@ class Vault:
         with self._lock:
             self._require_unlocked()
             return base64.b64encode(self._key).decode('ascii')
+
+    def reload(self):
+        """Re-read the entry index and MAC from disk.
+
+        get/set/delete/list_entries/search already do this automatically
+        when another connection has committed (one `PRAGMA data_version`
+        per call); reload() forces it. A tamper detected here latches
+        `tampered` exactly as at open — the flag only ever goes up.
+        """
+        with self._lock:
+            self._require_unlocked()
+            self._reload()
+
+    def rekey(self, new_password: Optional[str] = None,
+              new_key: Optional[bytes] = None) -> str:
+        """Rotate the master key. Returns the new key, base64-encoded.
+
+        Exactly one of `new_password` / `new_key` (32 raw bytes). Every entry
+        is re-encrypted and the master record and MAC replaced in one
+        transaction: if anything fails the file is untouched and the current
+        key stays valid. Refuses on a tampered or partly corrupt vault, since
+        re-signing would launder the damage.
+        """
+        if (new_password is None) == (new_key is None):
+            raise ValueError("provide exactly one of new_password= or new_key=")
+        if new_key is not None:
+            if not isinstance(new_key, (bytes, bytearray)) or len(new_key) != KEY_SIZE:
+                raise ValueError(f"new_key must be {KEY_SIZE} bytes")
+            new_key = bytes(new_key)
+        with self._lock:
+            self._require_unlocked()
+            self._require_writable()
+            self._sync()
+            self._require_untampered(live=True)
+            if self.corrupt_count:
+                raise VaultCorrupted(
+                    f"{self.corrupt_count} entries fail authenticated decryption; "
+                    "refusing to rekey a partly corrupt vault"
+                )
+            costs = default_costs()
+            if new_password is not None:
+                combined_salt, verify_hash, new_key = _create_master_record(
+                    new_password, costs)
+            else:
+                combined_salt, verify_hash = _create_master_record_for_key(new_key, costs)
+            try:
+                rekey_vault(self._conn, self._key, new_key, combined_salt,
+                            verify_hash, costs)
+            except sqlite3.OperationalError as exc:
+                if 'readonly' in str(exc).lower():
+                    raise VaultReadOnly(f"{self.path} is read-only: {exc}") from exc
+                raise VaultCorrupted(f"rekey failed: {exc}") from exc
+            except ValueError as exc:
+                raise VaultCorrupted(str(exc)) from exc
+            self._key = new_key
+            self._reload()
+            return base64.b64encode(new_key).decode('ascii')
 
     def close(self):
         """Drop the key and decrypted index, close the connection."""
@@ -362,6 +492,7 @@ class Vault:
     # ── Internals ────────────────────────────────────────────────────────
 
     def _reload(self):
+        self._data_version = self._conn.execute("PRAGMA data_version").fetchone()[0]
         self._entries, self.corrupt_count = load_entries(self._conn, self._key)
         # Detects whole-blob rollback, row insertion, and row deletion —
         # none of which per-entry authentication can see on its own. Raises
@@ -370,9 +501,25 @@ class Vault:
         if not verify_entries_mac(self._conn, self._key):
             self.tampered = True
 
+    def _sync(self):
+        """Reload if another connection has committed since the last load.
+
+        `PRAGMA data_version` changes only for *other* connections' commits,
+        so our own writes (which already reload) never trigger a second
+        decrypt pass. One cheap pragma per call is what keeps a long-lived
+        Vault from serving stale misses or inserting a duplicate row.
+        """
+        version = self._conn.execute("PRAGMA data_version").fetchone()[0]
+        if version != self._data_version:
+            self._reload()
+
     def _require_unlocked(self):
         if self._key is None:
             raise VaultLocked("vault is closed")
+
+    def _require_writable(self):
+        if self.readonly:
+            raise VaultReadOnly(f"{self.path} was opened read-only")
 
     def _require_untampered(self, live: bool = False):
         # Writes pass live=True: they re-sign whatever the database holds

@@ -79,31 +79,62 @@ def decrypt(nonce: bytes, ciphertext: bytes, key: bytes, aad: Optional[bytes] = 
 # The master row stores `combined_salt` (= kdf_salt + verify_salt) and a
 # verification hash of the derived key (never the key itself).
 
-def create_master_record(password: str) -> tuple[bytes, bytes, bytes]:
-    """Build a new master record. Returns (combined_salt, verify_hash, key)."""
+def create_master_record(password: str,
+                         costs: Optional[tuple[int, int, int]] = None,
+                         ) -> tuple[bytes, bytes, bytes]:
+    """Build a new master record. Returns (combined_salt, verify_hash, key).
+
+    `costs` = (time_cost, memory_cost, parallelism); None uses the constants.
+    Callers persist whichever was used (storage.save_master) so the record
+    keeps verifying after the constants change.
+    """
+    t, m, p = costs if costs is not None else (None, None, None)
     salt = secrets.token_bytes(SALT_SIZE)
-    key = derive_key(password, salt)
+    key = derive_key(password, salt, time_cost=t, memory_cost=m, parallelism=p)
     verify_salt = secrets.token_bytes(SALT_SIZE)
-    verify_hash = derive_key(base64.b64encode(key).decode(), verify_salt)
+    verify_hash = _verify_hash(key, verify_salt, t, m, p)
     return salt + verify_salt, verify_hash, key
 
 
+def create_master_record_for_key(key: bytes,
+                                 costs: Optional[tuple[int, int, int]] = None,
+                                 ) -> tuple[bytes, bytes]:
+    """Master record for a raw key (no password). Returns (combined_salt, verify_hash).
+
+    The KDF salt half is random and unused: any password derivation against
+    it yields a key that fails verification, which is the intended answer.
+    """
+    t, m, p = costs if costs is not None else (None, None, None)
+    salt = secrets.token_bytes(SALT_SIZE)
+    verify_salt = secrets.token_bytes(SALT_SIZE)
+    return salt + verify_salt, _verify_hash(key, verify_salt, t, m, p)
+
+
+def _verify_hash(key: bytes, verify_salt: bytes, t, m, p) -> bytes:
+    return derive_key(base64.b64encode(key).decode(), verify_salt,
+                      time_cost=t, memory_cost=m, parallelism=p)
+
+
 def verify_master_password(password: str, combined_salt: bytes,
-                           stored_hash: bytes) -> Optional[bytes]:
+                           stored_hash: bytes,
+                           costs: Optional[tuple[int, int, int]] = None,
+                           ) -> Optional[bytes]:
     """Derive and verify the master key. Returns None on wrong password."""
+    t, m, p = costs if costs is not None else (None, None, None)
     salt = combined_salt[:SALT_SIZE]
     verify_salt = combined_salt[SALT_SIZE:]
 
-    key = derive_key(password, salt)
-    verify_hash = derive_key(base64.b64encode(key).decode(), verify_salt)
+    key = derive_key(password, salt, time_cost=t, memory_cost=m, parallelism=p)
+    verify_hash = _verify_hash(key, verify_salt, t, m, p)
 
     if not hmac.compare_digest(verify_hash, stored_hash):
         return None
     return key
 
 
-def verify_master_key(key: bytes, combined_salt: bytes, stored_hash: bytes) -> bool:
+def verify_master_key(key: bytes, combined_salt: bytes, stored_hash: bytes,
+                      costs: Optional[tuple[int, int, int]] = None) -> bool:
     """Check a raw master key against the stored verification hash."""
+    t, m, p = costs if costs is not None else (None, None, None)
     verify_salt = combined_salt[SALT_SIZE:]
-    verify_hash = derive_key(base64.b64encode(key).decode(), verify_salt)
-    return hmac.compare_digest(verify_hash, stored_hash)
+    return hmac.compare_digest(_verify_hash(key, verify_salt, t, m, p), stored_hash)
