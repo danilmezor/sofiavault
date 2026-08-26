@@ -117,12 +117,14 @@ the `.v1-backup` file — it still contains the old plaintext metadata.
   and stored cost parameters, constant-time comparison, transparent
   rehash-on-verify, and dummy hashing for unknown/inactive usernames.
   There is no code path that returns a user's password. Rate limiting,
-  lockout, sessions, and 2FA are deliberately the calling application's
-  responsibility.
+  lockout and sessions are deliberately the calling application's
+  responsibility; since 0.4.0 TOTP, recovery codes and reset tokens are
+  the store's (see below).
 - **Anti-enumeration, stated precisely:** the decoy hash for an unknown
-  user is priced using the *cheapest cost parameters actually stored in
-  that database*, so it stays indistinguishable from a real verification
-  even after a cost upgrade leaves older rows behind. `add_user()` is
+  user is priced at the *most expensive cost parameters any real row
+  uses* (floored at the current defaults), and a cheaper legacy row is
+  padded up to that same ceiling on every verify, so neither "unknown" nor
+  "exists on an old row" is faster than the other. `add_user()` is
   deliberately not constant-time (it returns False for an existing name)
   — it is an administrative call and must not back a self-service signup
   route without the caller adding its own timing/response equalization.
@@ -143,12 +145,60 @@ the `.v1-backup` file — it still contains the old plaintext metadata.
   vault exists for secrets the app must read back (API keys, tokens);
   user passwords must only ever be stored as hashes.
 
+## Threat Model (0.4.0)
+
+| | |
+|---|---|
+| **Protects** | secrets at rest (vault); secrets absent from images / `.env` / `docker inspect` (for the consuming app's own containers); credential material at rest (Argon2id, encrypted seeds, keyed tags); replay of TOTP codes and recovery codes; offline brute force of recovery codes and reset tokens; transplant of ciphertext between rows/stores; stale-index duplicate writes; silent boot without secrets (doctor + allowlist fail-closed) |
+| **Does not protect** | a host root that can read the key file; secrets that must be passed to third-party images via their own env (they are out of `.env`, not out of their container's `inspect`); build-time constants in a shipped JS bundle (delivery-model problem, stays deferred); the app's session layer |
+
+## Credentials Layer (0.4.0)
+
+- **MFA material never leaves `fields_key`.** TOTP seeds are AES-256-GCM
+  blobs whose associated data binds them to one user *and* to the `totp`
+  slot (a seed cannot be transplanted into the profile-fields slot of the
+  same user, or vice versa). Recovery codes and password-reset tokens are
+  stored only as `HMAC-SHA256(fields_key, value)` tags — a copy of the
+  database without the key cannot brute-force a 50-bit recovery code
+  offline, nor mint a reset. A store created without `fields_key` cannot
+  hold any of this; the policy is one-way, and `sofiavault doctor` warns.
+- **TOTP replay is closed atomically.** The last accepted time-step is
+  read, the code checked, and the step written inside one
+  `BEGIN IMMEDIATE` transaction, so two submissions of the same code —
+  from two threads or two processes — cannot both succeed. A pending
+  enrolment (seed issued, never confirmed) is never accepted by
+  `totp_verify`. Every candidate step is compared with
+  `hmac.compare_digest` and every candidate is always evaluated.
+- **Recovery codes are single-use by construction**: the matching tag is
+  removed in the same transaction that accepts it.
+- **Legacy hashes are a bridge, not a home.** Users imported with
+  `import_sqlite` keep their old (e.g. bcrypt) hash as `legacy_hash` and a
+  placeholder Argon2 row that can never match; their first successful
+  login through the registered legacy verifier rewrites the row as
+  Argon2id and clears `legacy_hash`, as does redeeming a reset token. An
+  unknown scheme raises rather than silently denying. **Timing:** a
+  legacy row pays the Argon2 decoy ceiling *plus* the legacy scheme's own
+  cost, so until its first successful login it is distinguishable from an
+  unknown user by timing. Unknown users and ordinary Argon2 rows remain
+  indistinguishable from each other.
+- **Master-key rotation (`rekey`)** re-encrypts every entry and replaces
+  the master record and MAC in one transaction; a failure leaves the old
+  key valid. The master row's salt and Argon2 costs are covered by the
+  entry-set MAC (schema v4), so they cannot be swapped or rolled back
+  unnoticed, and the persisted costs mean a future change to the defaults
+  cannot lock an existing vault out.
+- **Read-only deployments.** `Vault.open(readonly=True)` (and every
+  read-only CLI command) opens the file with sqlite's `mode=ro`, never
+  creates, migrates or re-signs anything, and a vault that cannot be
+  written surfaces as the typed `VaultReadOnly` rather than a raw sqlite
+  error.
+
 ## Vault Wipe
 
 `sofiavault wipe` requires the master password plus a typed confirmation
 phrase. It then overwrites an explicit allowlist of SofiaVault's own files
 (`vault.db`, its WAL/journal sidecars, migration and import backups, the
-user auth store `users.db` created by `sofiavault auth import`, and the
+user auth store `users.db` created by `sofiavault auth import-json`, and the
 command history) with 3 passes of CSPRNG data, fsyncing between passes, before
 deleting them. Symlinks are removed without following, and no directory is
 swept — files outside the allowlist are never touched.

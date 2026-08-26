@@ -2,6 +2,76 @@
 
 All notable changes to SofiaVault will be documented in this file.
 
+## [0.4.0] - unreleased
+
+The first real server integration of 0.3.0 found every gap forced a
+workaround in the consuming app. 0.4.0 closes them: everything about
+secrets and human credentials lives in SofiaVault, and the app keeps only
+sessions and policy.
+
+### Added
+- **Allowlist files** (`envload.load_allowlist`, `load(allow_file=)`,
+  `exec_with_env(allow_file=)`, `sofiavault run --allow FILE`,
+  `SOFIAVAULT_ALLOW_FILE`): one reviewable file shared by the CLI and the
+  library. A configured-but-unusable file fails closed (`AllowListError`).
+- **`LoadReport`** from `envload.load()` — `injected`, `skipped`, a
+  `denied` map of allowlist-blocked names, `vault_path` — still unpacks as
+  the 0.3.0 `(injected, skipped)` pair.
+- **Non-interactive `env` commands** with an explicit `--vault`
+  (default `$SOFIAVAULT_DB`): `set` (stdin / `--from-file` / `--value`),
+  `get` (exit 3 if absent), `del`, `list`, `import [--allow] [--overwrite]`,
+  `export --allow FILE [--format dotenv|json]` (allowlist required). All
+  server commands unlock via the `open_auto` chain and prompt only on a TTY;
+  exit codes 0/1/2/3/127.
+- **`Vault.reload()`** and automatic refresh: `get/set/delete/list_entries/
+  search` notice other connections' commits (`PRAGMA data_version`), so a
+  long-lived `Vault` never serves stale misses or inserts a duplicate row.
+- **`Vault.open(readonly=True)`** and the typed **`VaultReadOnly`** error;
+  read-only CLI commands open the vault read-only.
+- **Master-key rotation**: `Vault.rekey(new_password=|new_key=)` and
+  `sofiavault rekey [--key-file PATH] [--print-key]` — every entry
+  re-encrypted and the master record replaced in one transaction.
+- **`sofiavault doctor`**: key file (exists / 0600 / owner), vault
+  (readable / writable / schema / MAC / entry count), allowlist, allowlisted
+  names missing from the vault, and the user store's fields-key policy.
+  Exit 0 only if the deployment would boot. README gains a Docker recipe,
+  tested against a real container when Docker is available.
+- **`UserStore` schema v2** — typed `role`, `is_admin`, `password_changed_at`
+  columns (`set_role`, `set_admin`, `list_users(role=, admin_only=)`);
+  **TOTP** (`sofiavault.totp`, RFC 6238, stdlib only) with `totp_enroll/
+  confirm/verify/disable/status` and an atomic replay guard; **recovery
+  codes** (`recovery_generate/use/remaining`, keyed HMAC tags, single-use);
+  **one-time reset tokens** (`reset_token_issue/redeem/revoke`);
+  **legacy verifiers** (`legacy_verifiers=`, `LegacyBcryptSha256Pepper`,
+  `import_sqlite`) that upgrade bcrypt-style hashes to Argon2id on first
+  login instead of forcing a mass reset. `AuthResult` gains `role`,
+  `is_admin`, `is_active`, `totp`, `password_changed_at`. v1 stores migrate
+  in place in one transaction.
+- **Auth CLI**: `auth import-json`, `import-sqlite --table --scheme [--map]`,
+  `list [--admins] [--role] [-v]`, `reset USER [--ttl]`, `totp status|disable`,
+  `set-flag`; `--db` defaults to `$SOFIAVAULT_USERS_DB`; fields key from
+  `SOFIAVAULT_FIELDS_KEY[_FILE]` (0600 rule), pepper from `SOFIAVAULT_PEPPER`.
+- `sofiavault[legacy-bcrypt]` optional extra.
+
+### Changed
+- **Vault schema v4**: the master record persists its Argon2 costs and is
+  covered by the entry-set MAC. v3 vaults migrate on first writable open;
+  `readonly=True` opens a v3 file without migrating it.
+- `env`, `run`, `rekey`, `doctor` and `auth` are parsed with `argparse`
+  (`--help` everywhere). The REPL and the one-shot fuzzy `sofiavault
+  <service>` path are unchanged.
+- `env set`/`env import` create a missing vault from `SOFIAVAULT_PASSWORD`
+  (non-interactively) or by prompting on a TTY; other commands require it.
+- The allowlist never widens: a denylisted name that is also allowlisted
+  raises unless `allow_unsafe_names=True`. `SOFIAVAULT_KEY`/`_PASSWORD`/
+  `_KEY_FILE` are refused as injectable names.
+- SECURITY.md's decoy-pricing statement corrected (the decoy is priced at
+  the *most expensive* row, and cheaper rows are padded up to it), and a
+  0.4.0 threat-model table added.
+
+### Deprecated
+- `sofiavault auth import` — alias of `auth import-json` for one release.
+
 ## [0.3.0] - 2026-08-05
 
 SofiaVault is now a plug-and-play library as well as a CLI. The design is
