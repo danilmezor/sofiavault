@@ -136,19 +136,32 @@ def test_T_11_4_import_sqlite_maps_flags_and_skips_existing():
             store.import_sqlite(src, "managers; DROP TABLE users", scheme="fake")
 
 
-def test_T_11_5_unknown_scheme_raises_never_silent_none():
+def test_T_11_5_unknown_scheme_is_denied_and_reported_to_the_operator():
+    """Originally 'raises, never a silent None'. The review (F14) showed the
+    raise named the account to the submitter — an existence oracle — so the
+    contract is now: verify() denies; the *operator* is warned at
+    construction, where the scheme list is known and no attacker is
+    listening."""
+    import warnings
     d = Path(tempfile.mkdtemp())
     src = _legacy_db(d, [("alice", _legacy_hash("alice-pw"), "r", 0, 1)])
     with UserStore(d / "users.db") as store:          # no verifiers registered
         store.import_sqlite(src, "managers", scheme="bcrypt-sha256-pepper")
-        with pytest.raises(AuthStoreError, match="no legacy verifier"):
-            store.verify("alice", "alice-pw")
-        with pytest.raises(AuthStoreError):
-            store.verify("alice", "wrong")
-    other = UserStore(d / "users.db", legacy_verifiers={"other": lambda p, h: True})
-    with pytest.raises(AuthStoreError, match="bcrypt-sha256-pepper"):
-        other.verify("alice", "alice-pw")
+        assert store.verify("alice", "alice-pw") is None
+        assert store.verify("alice", "wrong") is None
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        other = UserStore(d / "users.db", legacy_verifiers={"other": lambda p, h: True})
+    assert any("bcrypt-sha256-pepper" in str(w.message) for w in caught)
+    assert other.verify("alice", "alice-pw") is None
     other.close()
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        good = UserStore(d / "users.db", legacy_verifiers={
+            "bcrypt-sha256-pepper": LegacyBcryptSha256Pepper(PEPPER)})
+    assert not caught
+    assert good.verify("alice", "alice-pw") is not None
+    good.close()
     with pytest.raises(AuthStoreError):
         UserStore(d / "users.db", legacy_verifiers={"bad$name": lambda p, h: True})
 

@@ -102,12 +102,17 @@ def test_T_13_1_security_md_carries_the_threat_table_and_corrected_decoy_stateme
 
 # ── D-14: compatibility ──────────────────────────────────────────────────────
 
-#: 0.3.0 tests whose bodies changed for 0.4.0, each because it asserted the
-#: literal schema version 3 (now SCHEMA_VERSION). Anything else differing
-#: from the v0.3.0 tag is a compatibility break and fails this audit.
+#: 0.3.0 tests whose bodies changed for 0.4.0: five asserted the literal
+#: schema version 3 (now SCHEMA_VERSION), one greps for messages that moved
+#: files. Anything else differing from the v0.3.0 tag is a compatibility
+#: break and fails this audit.
 ALLOWED_CHANGES = {
     "test_cli_migration.py": {"test_cli_opens_v2_vault_without_losing_entries",
                              "test_cli_opens_v1_vault_without_losing_entries"},
+    # `env import` lives in cli_server.py since the pre-argparse command
+    # bodies were removed (review finding F21); the messages it greps for
+    # moved with it.
+    "test_release_review_fixes.py": {"test_t3_partial_env_import_message_is_accurate"},
     "test_security_regressions.py": {
         "test_h3_new_vaults_are_schema_v3",
         "test_h3_v2_vault_upgrades_transparently",

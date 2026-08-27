@@ -20,8 +20,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from . import __version__, cli_server, envload, paths
-from .auth import AuthStoreError, UserStore
+from . import __version__, cli_server, paths
 from .core import create_master_record, verify_master_password
 from .generator import (
     GEN_CHARSET,
@@ -55,13 +54,7 @@ from .storage import (
     update_entry,
     verify_entries_mac,
 )
-from .vault import (
-    Vault,
-    VaultCorrupted,
-    VaultLocked,
-    VaultNotInitialized,
-    WrongPassword,
-)
+from .vault import Vault
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Configuration
@@ -1334,11 +1327,9 @@ def cmd_import(session: VaultSession, csv_path: str):
 def _vault_from_session(session: VaultSession) -> Vault:
     """Wrap an unlocked CLI session in a library Vault (shares the conn).
 
-    Built fresh each call: the CLI writes through storage directly, so a
-    cached wrapper would keep serving the entry index it decrypted at
-    construction — and `import_env_file` decides what to skip from exactly
-    that index. The session's latched tamper flag is carried over, since a
-    new Vault starts out believing the vault is clean.
+    Built fresh each call so it never serves a stale entry index. The
+    session's latched tamper flag is carried over, since a new Vault starts
+    out believing the vault is clean.
     """
     vault = Vault(session.conn, session.key, paths.DB_PATH)
     if session.tampered:
@@ -1346,155 +1337,21 @@ def _vault_from_session(session: VaultSession) -> Vault:
     return vault
 
 
-def cmd_env(session: VaultSession, args: list[str]):
-    """Manage env:* entries: env import <.env file> | env list"""
-    if args and args[0] == 'import' and len(args) > 1:
-        src = Path(args[1]).expanduser()
-        if not src.exists():
-            print()
-            print_error(f"File not found: {src}")
-            print()
-            return
-        vault = _vault_from_session(session)
-        try:
-            imported, skipped, rejected = envload.import_env_file(vault, src)
-        except OSError as exc:
-            print_error(f"Could not read {src}: {exc}")
-            return
-        except envload.MalformedEnvFile as exc:
-            print()
-            print_error(str(exc))
-            print_warn("Nothing was imported.")
-            print()
-            return
-        except VaultCorrupted as exc:
-            # Vault.set re-verifies the entry-set MAC before every write, and
-            # each set commits as it goes — so this can land partway through.
-            print()
-            print_error(str(exc))
-            print_warn("The import stopped partway. Entries written before this "
-                       "point are already in the vault.")
-            print_info("Check with: sofiavault env list")
-            print()
-            return
-        session.reload()
-        print()
-        print(f"  {style(_hr(), C.DIM)}")
-        print_success(f"Imported {len(imported)} secrets as env:* entries")
-        for name in imported:
-            print(f"  {style(SYM_BULLET, C.CYAN)} {name}")
-        if skipped:
-            print_info(f"Skipped (already present or empty): {', '.join(skipped)}")
-        if rejected:
-            print()
-            print_error(f"Rejected {len(rejected)} unsafe variable name(s): "
-                        f"{', '.join(rejected)}")
-            print_warn("These control how programs load code (LD_PRELOAD, BASH_ENV,")
-            print_warn("PYTHONPATH, PATH, ...). Injecting them from a vault would let")
-            print_warn("anyone who can write one entry run code in your app.")
-        print()
-        print_warn("The source file still holds these secrets in plaintext.")
-        print_warn("Remove them from it and rotate anything that was exposed.")
-        print_info("Inject at boot with: sofiavault run -- <your command>")
-        print()
-    elif args and args[0] == 'list':
-        names = envload.list_env_entries(_vault_from_session(session))
-        print()
-        if not names:
-            print_info("No env:* entries yet. Add with: sofiavault env import <.env>")
-        else:
-            print(f"  {style('Environment entries', C.BOLD)}  "
-                  f"{style(f'({len(names)})', C.DIM)}")
-            print()
-            for name in names:
-                print(f"  {style(SYM_BULLET, C.CYAN)} {name}")
-        print()
-    else:
-        print_info("Usage: sofiavault env import <path/to/.env>")
-        print_info("       sofiavault env list")
+def cmd_env(session: Optional["VaultSession"], args: list[str]) -> None:
+    """0.3.0 entry point, kept for importers. The pre-argparse implementation
+    (no allowlist, interactive unlock) is gone (review finding F21): every
+    `env` invocation now goes through cli_server, which reads paths.DB_PATH."""
+    sys.exit(cli_server.main(["env", *args]))
 
 
-def cmd_run(args: list[str]):
-    """Inject env:* entries and exec a command: run [--vault PATH] -- cmd..."""
-    vault_path = paths.DB_PATH
-    rest = list(args)
-    if rest and rest[0] == '--vault':
-        if len(rest) < 2:
-            print_info("Usage: sofiavault run [--vault PATH] -- <command...>")
-            return
-        vault_path = Path(rest[1]).expanduser()
-        rest = rest[2:]
-    if rest and rest[0] == '--':
-        rest = rest[1:]
-    if not rest:
-        print_info("Usage: sofiavault run [--vault PATH] -- <command...>")
-        return
-
-    try:
-        vault = Vault.open_auto(vault_path)
-    except VaultLocked:
-        # We ARE the interactive layer — fall back to a prompt
-        if not vault_path.exists():
-            print_error(f"No vault at {vault_path}")
-            sys.exit(1)
-        password = get_master_password()
-        try:
-            vault = Vault.open(vault_path, password=password)
-        except WrongPassword:
-            print_error("Wrong password.")
-            sys.exit(1)
-    except (WrongPassword, VaultNotInitialized) as exc:
-        print_error(str(exc))
-        sys.exit(1)
-
-    try:
-        envload.exec_with_env(vault, rest)  # never returns on success
-    except FileNotFoundError:
-        print_error(f"Command not found: {rest[0]}")
-        sys.exit(127)
-    except envload.UnsafeVariableName as exc:
-        print_error(str(exc))
-        print_warn("Remove the entry with: sofiavault delete env:<name>")
-        sys.exit(1)
-    except VaultCorrupted as exc:
-        print_error(str(exc))
-        sys.exit(1)
+def cmd_run(args: list[str]) -> None:
+    """0.3.0 entry point, kept for importers; delegates to cli_server (F21)."""
+    sys.exit(cli_server.main(["run", *args]))
 
 
-def cmd_auth(args: list[str]):
-    """User-store operations: auth import <users.json> [--db PATH]"""
-    if len(args) >= 2 and args[0] == 'import':
-        src = Path(args[1]).expanduser()
-        db = paths.DB_PATH.parent / 'users.db'
-        if '--db' in args:
-            idx = args.index('--db')
-            if idx + 1 >= len(args):
-                print_info("Usage: sofiavault auth import <users.json> [--db PATH]")
-                return
-            db = Path(args[idx + 1]).expanduser()
-        if not src.exists():
-            print()
-            print_error(f"File not found: {src}")
-            print()
-            return
-        try:
-            with UserStore(db) as store:
-                created, skipped = store.import_json(src)
-        except (AuthStoreError, ValueError) as exc:
-            print_error(f"Import failed: {exc}")
-            return
-        print()
-        print(f"  {style(_hr(), C.DIM)}")
-        print_success(f"Created {len(created)} users in {db}")
-        if skipped:
-            print_info(f"Skipped: {', '.join(skipped)}")
-        print()
-        print_warn("The source file held PLAINTEXT passwords. Now:")
-        print_warn("  1. Delete it (and purge it from version control history).")
-        print_warn("  2. Rotate every imported password — they were exposed.")
-        print()
-    else:
-        print_info("Usage: sofiavault auth import <users.json> [--db PATH]")
+def cmd_auth(args: list[str]) -> None:
+    """0.3.0 entry point, kept for importers; delegates to cli_server (F21)."""
+    sys.exit(cli_server.main(["auth", *args]))
 
 
 def cmd_key(key: bytes):

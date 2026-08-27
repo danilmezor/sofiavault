@@ -93,6 +93,16 @@ sessions and policy.
 - `rekey` takes the write lock before reading rows (F7); `set()`/`delete()`
   hold it across the existence check, so two processes cannot both insert
   the same service (F8).
+- A legacy hash whose scheme has no registered verifier is now a plain
+  denial (raising named the account to the submitter); the operator is
+  warned when the store is opened (F14). `list_entries()`/`search()`/`env
+  list` refuse a tampered vault like every other read (F15). Every
+  `verify()` path makes exactly two Argon2 calls, removing the fixed
+  per-call overhead that marked below-ceiling rows (F16). `env get | head`
+  exits 1 quietly on a closed pipe (F17); the 8-character master-password
+  minimum applies off a TTY too (F18); `env set` on a TTY prompts with echo
+  off (F19). The pre-argparse `env`/`run`/`auth` bodies in `cli.py` (which
+  had no allowlist) are gone; the names delegate to the new layer (F21).
 - The unknown-user decoy's Argon2 work is capped at 16× the defaults, so
   one extreme row cannot price every login (F6). `doctor` checks real file
   and directory modes, the default `users.db`, and reports checks it could

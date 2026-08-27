@@ -752,7 +752,8 @@ def test_t2_cli_add_refuses_to_overwrite_an_unreadable_row(capsys):
 # ── t3: a partial env import must not be reported as "nothing imported" ──────
 
 def test_t3_partial_env_import_message_is_accurate():
-    src = (REPO_ROOT / "sofiavault" / "cli.py").read_text(encoding="utf-8")
+    # 0.4.0: `env import` moved to cli_server.py (review finding F21)
+    src = (REPO_ROOT / "sofiavault" / "cli_server.py").read_text(encoding="utf-8")
     assert "The import stopped partway" in src
     assert "Nothing was imported." in src  # still used for the parse-time abort
 

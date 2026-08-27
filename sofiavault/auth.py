@@ -37,6 +37,7 @@ import sqlite3
 import threading
 import time
 import unicodedata
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional, Union
@@ -130,6 +131,12 @@ _MAX_PARALLELISM = 16
 #: 256 MiB) so those rows stay padded; only a row beyond it is left
 #: unpadded, and it bounds what a tampered row can impose on everyone.
 _MAX_DECOY_MULTIPLIER = 16
+
+#: The cheapest Argon2 call the library makes. Every verify() path performs
+#: exactly two hash calls (the real or decoy hash, plus a padding call that
+#: is at least this large), so the fixed per-call overhead cannot separate
+#: an at-ceiling row from a below-ceiling one (review finding F16).
+_MIN_PAD_COSTS = (1, 8 * ARGON2_PARALLELISM, ARGON2_PARALLELISM)
 
 #: Shortest possible fields_enc blob: nonce + GCM tag. Anything shorter is
 #: truncated, and slicing it would reach AESGCM with a stub nonce, which
@@ -312,6 +319,26 @@ class UserStore:
         except BaseException:
             self.close()
             raise
+        self._warn_unverifiable_schemes()
+
+    def _warn_unverifiable_schemes(self):
+        """Warn once, at construction, about legacy schemes with no verifier.
+
+        verify() itself answers None for such rows (F14): raising there
+        would name the account to whoever submitted the password, an
+        existence oracle. The operator hears about it here instead.
+        """
+        rows = self._conn.execute(
+            "SELECT DISTINCT substr(legacy_hash, 1, instr(legacy_hash, '$') - 1) "
+            "FROM users WHERE legacy_hash IS NOT NULL").fetchall()
+        missing = sorted({r[0] for r in rows if isinstance(r[0], str) and r[0]
+                          and r[0] not in self._legacy})
+        if missing:
+            warnings.warn(
+                f"{self.path}: users hold legacy hashes for scheme(s) "
+                f"{', '.join(missing)} but no verifier is registered; their logins "
+                "will be denied until UserStore(legacy_verifiers=...) provides one",
+                RuntimeWarning, stacklevel=3)
 
     def _init_schema(self):
         v2_defs = ",\n".join(f"                {n} {d}" for n, d in _V2_COLUMNS)
@@ -528,11 +555,15 @@ class UserStore:
                           memory_cost=memory_cost, parallelism=parallelism)
 
     def _burn_dummy_hash(self, password: str):
-        """Matched-cost decoy for unknown/inactive users (anti-enumeration)."""
+        """Matched-cost decoy for unknown/inactive users (anti-enumeration).
+
+        Two calls, like every real-row path (see _MIN_PAD_COSTS).
+        """
         if not _utf8_encodable(password):
             password = _DECOY_PASSWORD
         t, m, p = self._dummy_costs()
         self._hash(password, self._dummy_salt, t, m, p)
+        self._hash(password, self._dummy_salt, *_MIN_PAD_COSTS)
 
     # ── Field encryption ─────────────────────────────────────────────────
 
@@ -994,9 +1025,8 @@ class UserStore:
             # ceiling. Before the comparison, so the wrong-password and
             # correct-password paths both pay it — padding only the failures
             # would be an oracle of its own.
-            pad = _padding_costs(costs, self._dummy_costs())
-            if pad is not None:
-                self._hash(password, self._dummy_salt, *pad)
+            pad = _padding_costs(costs, self._dummy_costs()) or _MIN_PAD_COSTS
+            self._hash(password, self._dummy_salt, *pad)
             if not hmac.compare_digest(computed, stored_hash):
                 return None
 
@@ -1037,14 +1067,11 @@ class UserStore:
         scheme, sep, payload = str(row['legacy_hash']).partition('$')
         verifier = self._legacy.get(scheme) if sep else None
         if verifier is None:
-            # Never a silent None: the operator configured an import for a
-            # scheme this process cannot verify, and every login for that
-            # user would otherwise look like a wrong password.
+            # A plain denial: raising here would tell whoever submitted the
+            # password that the account exists (F14). The operator was warned
+            # at construction (_warn_unverifiable_schemes).
             self._burn_dummy_hash(password)
-            raise AuthStoreError(
-                f"no legacy verifier registered for scheme {scheme!r} "
-                f"(user {row['username']!r}); pass legacy_verifiers= to UserStore"
-            )
+            return None
         self._burn_dummy_hash(password)
         if not verifier(password, payload):
             return None

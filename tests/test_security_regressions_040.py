@@ -590,3 +590,137 @@ def test_F_13_read_only_opens_survive_question_marks_in_the_path(monkeypatch):
         "sofiavault/storage.py", "sofiavault/auth.py", "sofiavault/cli.py",
         "sofiavault/cli_server.py"])
     assert not re.search(r'f"file:\{', src_text), "hand-built sqlite URIs remain"
+
+
+# ── F14–F19, F21: the LOW / INFO items ──────────────────────────────────────
+
+def test_F_14_unregistered_legacy_scheme_denies_like_a_wrong_password():
+    import warnings
+    d = _tmp()
+    src = d / "legacy.db"
+    c = sqlite3.connect(str(src))
+    c.execute("CREATE TABLE m (username TEXT, password_hash TEXT)")
+    c.execute("INSERT INTO m VALUES ('alice', 'h')")
+    c.commit()
+    c.close()
+    with UserStore(d / "users.db") as s:
+        s.import_sqlite(src, "m", scheme="ancient")
+    # opening a store that holds schemes this process cannot verify warns once…
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        s = UserStore(d / "users.db")
+    assert any("ancient" in str(w.message) for w in caught), [str(w.message) for w in caught]
+    # …and verify() is a plain denial, indistinguishable from a wrong password
+    # or an unknown user (no exception naming the account)
+    assert s.verify("alice", "anything") is None
+    assert s.verify("nobody", "anything") is None
+    s.close()
+
+
+def test_F_15_list_and_search_refuse_a_tampered_vault(monkeypatch, capsys):
+    d = _tmp()
+    path = d / "s.db"
+    v = Vault.create(path, "pw-12345678")
+    v.set("env:a", "1")
+    _sql(path, "UPDATE vault_meta SET value = '00' WHERE key = 'entries_mac'")
+    v.reload()
+    with pytest.raises(VaultCorrupted):
+        v.list_entries()
+    with pytest.raises(VaultCorrupted):
+        v.search("a")
+    with pytest.raises(VaultCorrupted):
+        envload.list_env_entries(v)
+    v.close()
+    monkeypatch.setenv("SOFIAVAULT_PASSWORD", "pw-12345678")
+    assert cli_server.main(["env", "list", "--vault", str(path)]) == 1
+    out, err = capsys.readouterr()
+    assert out == "" and "authentication tag" in err
+
+
+def test_F_16_every_verify_path_makes_the_same_number_of_hash_calls():
+    from sofiavault.core import ARGON2_MEMORY_COST, ARGON2_TIME_COST
+    d = _tmp()
+    path = d / "users.db"
+    with UserStore(path) as s:
+        s.add_user("ceiling", "pw-ceiling-1")
+        s.add_user("cheap", "pw-cheap-1")
+    # one row at the ceiling, one legacy-cheap row below it
+    _sql(path, "UPDATE users SET time_cost = ?, memory_cost = ? WHERE username = 'cheap'",
+         (max(1, ARGON2_TIME_COST - 1), ARGON2_MEMORY_COST // 2))
+    calls = []
+    with UserStore(path) as s:
+        real = s._hash
+
+        def counting(*a, **k):
+            calls.append(1)
+            return real(*a, **k)
+        s._hash = counting
+        for user, pw in (("ceiling", "wrong"), ("cheap", "wrong"), ("nobody", "wrong"),
+                         ("ceiling", "pw-ceiling-1")):
+            calls.clear()
+            s.verify(user, pw)
+            assert len(calls) == 2, (user, len(calls))
+
+
+def test_F_17_broken_pipe_on_stdout_is_a_documented_exit(monkeypatch, capsys):
+    d = _tmp()
+    path = d / "s.db"
+    v = Vault.create(path, "pw-12345678")
+    v.set("env:a", "1")
+    v.close()
+    monkeypatch.setenv("SOFIAVAULT_PASSWORD", "pw-12345678")
+
+    class Broken(io.StringIO):
+        def write(self, *_):
+            raise BrokenPipeError(32, "Broken pipe")
+
+    monkeypatch.setattr(sys, "stdout", Broken())
+    code = cli_server.main(["env", "get", "A", "--vault", str(path)])
+    assert code == 1
+    assert "Traceback" not in capsys.readouterr().err
+
+
+def test_F_18_master_password_length_is_enforced_off_tty_too(monkeypatch, capsys):
+    d = _tmp()
+    path = d / "s.db"
+    monkeypatch.setattr(paths, "DB_PATH_FROM_ENV", False)
+    monkeypatch.setenv("SOFIAVAULT_PASSWORD", "short")
+    monkeypatch.setattr(sys, "stdin", io.StringIO("value\n"))
+    assert cli_server.main(["env", "set", "A", "--vault", str(path)]) == 2
+    assert not path.exists()
+    assert "8 characters" in capsys.readouterr().err
+    Vault.create(path, "pw-12345678").close()
+    monkeypatch.setenv("SOFIAVAULT_PASSWORD", "pw-12345678")
+    monkeypatch.setattr(sys, "stdin", io.StringIO("short\n"))
+    assert cli_server.main(["rekey", "--vault", str(path)]) == 2
+    Vault.open(path, password="pw-12345678").close()       # not rotated
+
+
+def test_F_19_env_set_on_a_tty_uses_getpass(monkeypatch, capsys):
+    import getpass
+    d = _tmp()
+    path = d / "s.db"
+    Vault.create(path, "pw-12345678").close()
+    monkeypatch.setenv("SOFIAVAULT_PASSWORD", "pw-12345678")
+
+    class Tty(io.StringIO):
+        def isatty(self):
+            return True
+
+    monkeypatch.setattr(sys, "stdin", Tty("typed-in-the-clear\n"))
+    monkeypatch.setattr(getpass, "getpass", lambda *a, **k: "from-getpass")
+    assert cli_server.main(["env", "set", "TOKEN", "--vault", str(path)]) == 0
+    with Vault.open(path, password="pw-12345678") as v:
+        assert v.get("env:token") == "from-getpass"
+
+
+def test_F_21_no_pre_argparse_server_code_remains_in_cli():
+    from sofiavault import cli
+    src = (Path(__file__).resolve().parent.parent / "sofiavault" / "cli.py").read_text()
+    assert "exec_with_env(" not in src
+    assert "import_env_file(" not in src
+    assert "import_json(" not in src
+    # the 0.3.0 names still exist and delegate to the argparse layer
+    for name in ("cmd_env", "cmd_run", "cmd_auth"):
+        assert callable(getattr(cli, name))
+    assert "cli_server.main" in src

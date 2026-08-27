@@ -153,8 +153,14 @@ def check_private_file(path: Path, label: str):
         )
 
 
+MIN_PASSWORD_LENGTH = 8
+
+
 def _create(path: Path) -> Vault:
     password = os.environ.get("SOFIAVAULT_PASSWORD")
+    if password and len(password) < MIN_PASSWORD_LENGTH:
+        raise _Exit(EXIT_USAGE, f"SOFIAVAULT_PASSWORD must be at least "
+                                f"{MIN_PASSWORD_LENGTH} characters to create a vault")
     if not password:
         if not _stdin_is_tty():
             raise _Exit(EXIT_USAGE, f"no vault at {path}; set SOFIAVAULT_PASSWORD "
@@ -182,7 +188,9 @@ def _read_value(args) -> str:
             return Path(args.from_file).expanduser().read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError) as exc:
             raise _Exit(EXIT_ERROR, f"cannot read {args.from_file}: {exc}") from exc
-    data = sys.stdin.read()
+    # A person typing at a terminal gets a prompt with echo off (F19);
+    # scripts still pipe the value in.
+    data = getpass.getpass(f"Value for {args.name}: ") if _stdin_is_tty() else sys.stdin.read()
     if data.endswith("\n"):
         data = data[:-1]   # `echo value |` and heredocs add one; keep anything else
     if not data:
@@ -249,7 +257,15 @@ def cmd_env_import(args) -> int:
             imported, skipped, rejected = envload.import_env_file(
                 v, src, overwrite=args.overwrite, allow=allow)
         except envload.MalformedEnvFile as exc:
-            raise _Exit(EXIT_ERROR, f"{exc}\nnothing was imported") from exc
+            # Parse-time abort: validation happens before any write.
+            raise _Exit(EXIT_ERROR, f"{exc}\nNothing was imported.") from exc
+        except VaultCorrupted as exc:
+            # Vault.set re-verifies the entry-set MAC before every write and
+            # each set commits as it goes — so this can land partway through.
+            raise _Exit(EXIT_ERROR,
+                        f"{exc}\nThe import stopped partway. Entries written before "
+                        "this point are already in the vault; check with: "
+                        "sofiavault env list") from exc
     for name in imported:
         print(f"imported {name}")
     for name in skipped:
@@ -309,6 +325,9 @@ def _read_new_password() -> str:
     if not pw:
         raise _Exit(EXIT_USAGE, "new password expected on stdin (or --key-file PATH "
                                 "to rotate to a fresh random key)")
+    if len(pw) < MIN_PASSWORD_LENGTH:
+        raise _Exit(EXIT_USAGE, f"new password must be at least {MIN_PASSWORD_LENGTH} "
+                                "characters")
     return pw
 
 
@@ -498,9 +517,12 @@ def cmd_doctor(args) -> int:
                     rep.ok("entry-set MAC verifies")
                 if v.corrupt_count:
                     rep.problem(f"{v.corrupt_count} entries fail authenticated decryption")
-                names = envload.list_env_entries(v)
-                rep.ok(f"{len(v.list_entries())} entries, {len(names)} env:* entries")
-                _check_allow(rep, args.allow, names)
+                if v.tampered:
+                    _check_allow(rep, args.allow, None)
+                else:
+                    names = envload.list_env_entries(v)
+                    rep.ok(f"{len(v.list_entries())} entries, {len(names)} env:* entries")
+                    _check_allow(rep, args.allow, names)
             finally:
                 v.close()
         else:
@@ -936,6 +958,12 @@ def main(argv: list) -> int:
         return EXIT_ERROR
     except VaultError as exc:
         _err(str(exc))
+        return EXIT_ERROR
+    except BrokenPipeError:
+        # `env get NAME | head -c 8`: the reader went away. Not an error of
+        # ours, but not exit 120 with a traceback either (F17).
+        with contextlib.suppress(Exception):
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
         return EXIT_ERROR
     except KeyboardInterrupt:
         return 130

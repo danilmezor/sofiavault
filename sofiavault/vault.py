@@ -407,10 +407,15 @@ class Vault:
             self._reload()
 
     def list_entries(self) -> list[VaultEntry]:
-        """Decrypted metadata (service, username, url) — no passwords."""
+        """Decrypted metadata (service, username, url) — no passwords.
+
+        Refuses on a tampered vault like every other read: a rolled-back
+        or thinned-out index is not something to list as if it were true.
+        """
         with self._lock:
             self._require_unlocked()
             self._sync()
+            self._require_untampered()
             return list(self._entries)
 
     def search(self, query: str, threshold: int = 60) -> list[tuple[VaultEntry, int]]:
@@ -418,6 +423,7 @@ class Vault:
         with self._lock:
             self._require_unlocked()
             self._sync()
+            self._require_untampered()
             return fuzzy_find_service(self._entries, query, threshold)
 
     # ── Key management / lifecycle ───────────────────────────────────────
