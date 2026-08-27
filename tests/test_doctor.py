@@ -81,3 +81,15 @@ def test_doctor_other_failure_modes(deployment, capsys, monkeypatch):
     assert cli_server.main(["doctor", "--vault", str(vault)]) == 1
     out = capsys.readouterr().out
     assert "no key source" in out and "no allowlist configured" in out
+
+
+def test_S_5_doctor_warns_when_the_user_store_has_no_fields_key(deployment, capsys):
+    from sofiavault.auth import UserStore
+    d, vault, key_file, allow = deployment
+    with UserStore(d / "users.db") as s:
+        s.add_user("alice", "alice-pw-1")
+    assert cli_server.main(["doctor", "--vault", str(vault), "--allow", str(allow),
+                            "--users-db", str(d / "users.db")]) == 0
+    out = capsys.readouterr().out
+    assert "warning  user store" in out and "no fields key" in out
+    assert "import-sqlite" in out

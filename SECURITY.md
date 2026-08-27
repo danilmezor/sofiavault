@@ -149,8 +149,8 @@ the `.v1-backup` file — it still contains the old plaintext metadata.
 
 | | |
 |---|---|
-| **Protects** | secrets at rest (vault); secrets absent from images / `.env` / `docker inspect` (for the consuming app's own containers); credential material at rest (Argon2id, encrypted seeds, keyed tags); replay of TOTP codes and recovery codes; offline brute force of recovery codes and reset tokens; transplant of ciphertext between rows/stores; stale-index duplicate writes; silent boot without secrets (doctor + allowlist fail-closed) |
-| **Does not protect** | a host root that can read the key file; secrets that must be passed to third-party images via their own env (they are out of `.env`, not out of their container's `inspect`); build-time constants in a shipped JS bundle (delivery-model problem, stays deferred); the app's session layer |
+| **Protects** | secrets at rest (vault), secrets absent from images / `.env` / `docker inspect` (for the consuming app's own containers), credential material at rest (Argon2id, encrypted seeds, keyed tags), replay of TOTP codes and recovery codes, offline brute force of recovery codes and reset tokens, transplant of ciphertext between rows/stores, stale-index duplicate writes, silent boot without secrets (doctor + allowlist fail-closed). |
+| **Does not protect** | a host root that can read the key file; secrets that must be passed to third-party images via their own env (they are out of `.env`, not out of their container's `inspect`); build-time constants in a shipped JS bundle (delivery-model problem, stays deferred); the app's session layer. |
 
 ## Credentials Layer (0.4.0)
 

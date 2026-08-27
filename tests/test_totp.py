@@ -78,3 +78,38 @@ def test_secret_and_uri_helpers():
         totp.code_at("not base32!", 59)
     with pytest.raises(totp.TOTPError):
         totp.code_at(s, 59, algorithm="MD5")
+
+
+@pytest.mark.slow
+def test_totp_verify_timing_does_not_track_the_first_differing_digit():
+    """Advisory statistical companion to T-8-6 (the structural test is the
+    gate). Codes that differ from the right one in the first digit and in
+    the last digit must take the same time to reject, within a generous
+    bound: with compare_digest and no early exit there is no reason for
+    any correlation at all."""
+    import statistics
+    import time as _time
+    secret = totp.generate_secret()
+    t = 1_700_000_000
+    right = totp.code_at(secret, t)
+
+    def flip(i):
+        d = str((int(right[i]) + 1) % 10)
+        return right[:i] + d + right[i + 1:]
+
+    first, last = flip(0), flip(5)
+
+    def median_ns(code, n=400):
+        samples = []
+        for _ in range(n):
+            t0 = _time.perf_counter_ns()
+            totp.verify(secret, code, t)
+            samples.append(_time.perf_counter_ns() - t0)
+        return statistics.median(samples)
+
+    # interleave to share any drift
+    a = b = 0
+    for _ in range(5):
+        a += median_ns(first)
+        b += median_ns(last)
+    assert abs(a - b) < 0.5 * max(a, b), (a, b)

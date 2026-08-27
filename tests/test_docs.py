@@ -4,6 +4,7 @@ The design document lives outside the repository, so the authoritative list
 of test ids is checked in at tests/fixtures/test-ids-0.4.0.txt. When the
 design doc is present locally, its id set must match that file.
 """
+import os
 import re
 import sqlite3
 import subprocess
@@ -58,25 +59,42 @@ def test_every_design_test_id_is_implemented():
 
 # ── D-13: the threat-model table is in SECURITY.md verbatim ─────────────────
 
-THREAT_TABLE = "\n".join([
-    '| | |',
-    '|---|---|',
-    ('| **Protects** | secrets at rest (vault); secrets absent from images / `.env` / '
-     "`docker inspect` (for the consuming app's own containers); credential material at "
-     'rest (Argon2id, encrypted seeds, keyed tags); replay of TOTP codes and recovery '
-     'codes; offline brute force of recovery codes and reset tokens; transplant of '
-     'ciphertext between rows/stores; stale-index duplicate writes; silent boot without '
-     'secrets (doctor + allowlist fail-closed) |'),
-    ('| **Does not protect** | a host root that can read the key file; secrets that must '
-     'be passed to third-party images via their own env (they are out of `.env`, not out '
-     "of their container's `inspect`); build-time constants in a shipped JS bundle "
-     "(delivery-model problem, stays deferred); the app's session layer |"),
-])
+# Fallback copies of the D-13 paragraphs, used when the (local-only) design
+# doc is absent; when it is present the test reads the paragraphs from it.
+PROTECTS = (
+    'secrets at rest (vault), secrets absent from images / `.env` / `docker inspect` '
+    "(for the consuming app's own containers), credential material at rest (Argon2id, "
+    'encrypted seeds, keyed tags), replay of TOTP codes and recovery codes, offline '
+    'brute force of recovery codes and reset tokens, transplant of ciphertext between '
+    'rows/stores, stale-index duplicate writes, silent boot without secrets (doctor + '
+    'allowlist fail-closed).'
+)
+DOES_NOT_PROTECT = (
+    'a host root that can read the key file; secrets that must be passed to '
+    'third-party images via their own env (they are out of `.env`, not out of their '
+    "container's `inspect`); build-time constants in a shipped JS bundle "
+    "(delivery-model problem, stays deferred); the app's session layer."
+)
+
+
+def _threat_paragraphs() -> tuple:
+    if DESIGN_DOC.exists():
+        text = DESIGN_DOC.read_text()
+        sec = text[text.index("### D-13"):text.index("### D-14")]
+
+        def para(prefix):
+            m = re.search(re.escape(prefix) + r"(.*?)\n\n", sec, re.S)
+            return " ".join(m.group(1).split())
+        return para("Protects: "), para("Does not protect: ")
+    return PROTECTS, DOES_NOT_PROTECT
 
 
 def test_T_13_1_security_md_carries_the_threat_table_and_corrected_decoy_statement():
     text = (ROOT / "SECURITY.md").read_text()
-    assert THREAT_TABLE in text
+    normalized = " ".join(text.split())
+    protects, does_not = _threat_paragraphs()
+    assert f"| **Protects** | {protects} |" in normalized
+    assert f"| **Does not protect** | {does_not} |" in normalized
     assert "cheapest cost parameters" not in text
     assert "most expensive cost parameters" in text
     assert "timing" in text and "legacy" in text.lower()
@@ -116,9 +134,28 @@ def _git_show(ref: str, path: str):
     return out.stdout if out.returncode == 0 else None
 
 
+#: Preamble (everything before the first test) lines that may differ from
+#: v0.3.0, per file: (removed lines, added lines). Anything else — including
+#: a module-level `pytestmark = pytest.mark.skip` that would silence every
+#: 0.3.0 regression test (review finding S3) — fails the audit.
+ALLOWED_PREAMBLE_CHANGES = {
+    "test_security_regressions.py": (
+        {"from sofiavault.storage import get_schema_version"},
+        {"from sofiavault.storage import SCHEMA_VERSION, get_schema_version"},
+    ),
+}
+
+
+def _preamble(text: str) -> list:
+    return text.split("def test_", 1)[0].splitlines()
+
+
 def test_T_14_1_the_0_3_0_test_suite_is_unmodified_except_for_enumerated_tests():
     listing = _git_show("v0.3.0", "tests")
     if listing is None:
+        if os.environ.get("CI"):
+            pytest.fail("v0.3.0 tag not available: the 0.3.0 compatibility audit cannot "
+                        "run — fetch tags in CI (review finding S2)")
         pytest.skip("v0.3.0 tag not available")
     files = [line for line in listing.splitlines() if line.endswith(".py")]
     assert len(files) > 10
@@ -126,7 +163,14 @@ def test_T_14_1_the_0_3_0_test_suite_is_unmodified_except_for_enumerated_tests()
         old = _git_show("v0.3.0", f"tests/{name}")
         new_path = TESTS / name
         assert new_path.exists(), f"0.3.0 test file removed: {name}"
-        old_bodies, new_bodies = _test_bodies(old), _test_bodies(new_path.read_text())
+        new_text = new_path.read_text()
+        removed = set(_preamble(old)) - set(_preamble(new_text))
+        added = set(_preamble(new_text)) - set(_preamble(old))
+        allowed_removed, allowed_added = ALLOWED_PREAMBLE_CHANGES.get(name, (set(), set()))
+        assert removed <= allowed_removed and added <= allowed_added, (
+            f"{name}: module preamble changed since 0.3.0: -{sorted(removed - allowed_removed)}"
+            f" +{sorted(added - allowed_added)}")
+        old_bodies, new_bodies = _test_bodies(old), _test_bodies(new_text)
         missing = set(old_bodies) - set(new_bodies)
         assert not missing, f"{name}: 0.3.0 tests removed: {sorted(missing)}"
         changed = {n for n in old_bodies if old_bodies[n] != new_bodies[n]}

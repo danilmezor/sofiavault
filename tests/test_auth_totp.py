@@ -22,23 +22,29 @@ def _store() -> tuple[UserStore, Path]:
 
 
 def test_T_8_3_sixteen_threads_same_code_exactly_one_succeeds():
+    """Half the threads use a second UserStore on the same file, so the
+    guarantee rests on the database write lock (BEGIN IMMEDIATE), not on
+    one instance's in-process RLock (review finding S1)."""
     s, path = _store()
     secret = s.totp_enroll("alice")
     assert s.totp_confirm("alice", totp.code_at(secret, T - 60), now=T - 60)
     code = totp.code_at(secret, T)
     results = []
     start = threading.Barrier(16)
+    second = UserStore(path, fields_key=KEY)
 
-    def attempt():
+    def attempt(store):
         start.wait()
-        results.append(s.totp_verify("alice", code, now=T))
+        results.append(store.totp_verify("alice", code, now=T))
 
-    threads = [threading.Thread(target=attempt) for _ in range(16)]
+    threads = [threading.Thread(target=attempt, args=(s if i % 2 else second,))
+               for i in range(16)]
     for t in threads:
         t.start()
     for t in threads:
         t.join()
     assert results.count(True) == 1 and len(results) == 16
+    second.close()
 
     # and across *processes*: a second store on the same file sees the counter
     other = UserStore(path, fields_key=KEY)

@@ -154,9 +154,10 @@ def test_T_3_7_vault_flag_respected_and_home_untouched(sandbox, monkeypatch, cap
                 "--allow", str(allow)]) == 0
     assert run(["env", "export", "--vault", str(vault), "--allow", str(allow)]) == 0
     assert run(["env", "del", "A", "--vault", str(vault)]) == 0
-    assert run(["doctor", "--vault", str(vault), "--allow", str(allow)]) in (0, 1)
+    # A was just deleted, so doctor must report exactly that
+    assert run(["doctor", "--vault", str(vault), "--allow", str(allow)]) == 1
+    assert "missing from the vault: A" in capsys.readouterr().out
     assert not (d / "home" / ".sofiavault").exists()
-    capsys.readouterr()
     # and the SOFIAVAULT_DB default is echoed so nobody edits the wrong vault
     monkeypatch.setattr(paths, "DB_PATH", vault)
     monkeypatch.setattr(paths, "DB_PATH_FROM_ENV", True)

@@ -37,5 +37,5 @@ HISTORY_PATH = _HOME / ".history"
 #: True when the vault location came from SOFIAVAULT_DB rather than the
 #: default. The CLI echoes the path on unlock in that case so an operator
 #: never edits the wrong vault silently.
-DB_PATH_FROM_ENV: bool = DB_PATH != _HOME / "vault.db"
-USERS_DB_PATH_FROM_ENV: bool = USERS_DB_PATH != _HOME / "users.db"
+DB_PATH_FROM_ENV: bool = bool((os.environ.get("SOFIAVAULT_DB") or "").strip())
+USERS_DB_PATH_FROM_ENV: bool = bool((os.environ.get("SOFIAVAULT_USERS_DB") or "").strip())

@@ -104,7 +104,8 @@ def test_T_12_2_reset_token_from_cli_redeems_through_the_library(sandbox, capsys
     # without a fields key the command fails with the documented remedy
     os.environ.pop("SOFIAVAULT_FIELDS_KEY")
     assert cli_server.main(["auth", "reset", "alice", "--db", str(db)]) == 1
-    assert "fields_key" in capsys.readouterr().err or "fields" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "fields_key required" in err and "import-sqlite" in err
 
 
 @pytest.mark.skipif(os.name != "posix", reason="file modes")
