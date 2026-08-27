@@ -634,7 +634,7 @@ def _is_vault_file(path: Path) -> bool:
         with open(path, 'rb') as f:
             if not f.read(16).startswith(b"SQLite format 3"):
                 return False
-        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        conn = sqlite3.connect(_db_uri(path, 'ro'), uri=True)
         try:
             cur = conn.execute(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='master'"
@@ -790,13 +790,16 @@ def rekey_vault(conn: sqlite3.Connection, old_key: bytes, new_key: bytes,
     never launder a corrupt or tampered row into a freshly signed set.
     Returns the number of entries re-encrypted.
     """
-    vault_id = _ensure_vault_id(conn)
-    rows = conn.execute(
-        "SELECT id, salt, nonce, blob FROM entries_v2 ORDER BY id"
-    ).fetchall()
+    # Take the write lock *before* reading the rows: a row committed by
+    # another connection between the SELECT and the lock would be left
+    # under the old key — unreadable under either (review finding F7).
     if not conn.in_transaction:
         conn.execute("BEGIN IMMEDIATE")
     try:
+        vault_id = _ensure_vault_id(conn)
+        rows = conn.execute(
+            "SELECT id, salt, nonce, blob FROM entries_v2 ORDER BY id"
+        ).fetchall()
         for row_id, salt, nonce, blob in rows:
             aad = _entry_aad(vault_id, row_id)
             try:
@@ -834,7 +837,7 @@ def is_legacy_vault_file(db_path: Path) -> bool:
     try:
         if not db_path.exists():
             return False
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn = sqlite3.connect(_db_uri(db_path, 'ro'), uri=True)
         try:
             return _table_exists(conn, 'entries')
         finally:

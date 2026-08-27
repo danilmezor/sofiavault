@@ -27,7 +27,7 @@ from typing import Optional
 from . import envload, paths
 from .auth import AuthStoreError, UserStore
 from .core import KEY_SIZE
-from .storage import get_schema_version, verify_entries_mac
+from .storage import _db_uri, get_schema_version, verify_entries_mac
 from .vault import (
     Vault,
     VaultCorrupted,
@@ -460,7 +460,8 @@ def cmd_doctor(args) -> int:
     if key_file is not None:
         _check_key_file(rep, key_file)
     elif os.environ.get("SOFIAVAULT_KEY"):
-        rep.ok("key source: SOFIAVAULT_KEY")
+        rep.warn("key source: SOFIAVAULT_KEY (visible in the process environment and "
+                 "`docker inspect`; prefer a 0600 key file)")
     elif os.environ.get("SOFIAVAULT_PASSWORD"):
         rep.warn("key source: SOFIAVAULT_PASSWORD (Argon2 derivation on every open; "
                  "prefer a key file for long-running services)")
@@ -478,8 +479,9 @@ def cmd_doctor(args) -> int:
         else:
             rep.ok(f"vault {path} readable" + (", writable" if writable else
                                                 ", read-only (open with readonly=True)"))
+        _check_private_perms(rep, path, "vault")
         v = None
-        if readable and not rep.problems:
+        if readable:
             try:
                 v = _open(path, readonly=True)
             except _Exit as exc:
@@ -502,10 +504,14 @@ def cmd_doctor(args) -> int:
             finally:
                 v.close()
         else:
+            # A check that could not run is a finding, not a pass.
+            rep.problem("entry-set MAC and entry count not checked (vault could not "
+                        "be unlocked)")
             _check_allow(rep, args.allow, None)
 
     users_db = Path(args.users_db).expanduser() if args.users_db else (
-        paths.USERS_DB_PATH if paths.USERS_DB_PATH_FROM_ENV else None)
+        paths.USERS_DB_PATH if (paths.USERS_DB_PATH_FROM_ENV or paths.USERS_DB_PATH.exists())
+        else None)
     if users_db is not None:
         _check_users_db(rep, users_db)
 
@@ -515,13 +521,40 @@ def cmd_doctor(args) -> int:
     return EXIT_OK if not rep.problems else EXIT_ERROR
 
 
+def _check_private_perms(rep: _Report, path: Path, label: str):
+    """Real modes, not os.access(): a 0666 vault or a 0777 directory passes
+    `os.access` for the owner and is still writable by everyone (F12)."""
+    if os.name != "posix":
+        return
+    try:
+        st = path.stat()
+    except OSError:
+        return
+    mode = stat.S_IMODE(st.st_mode)
+    if mode & 0o022:
+        rep.problem(f"{label} {path} is group/world-writable (mode {oct(mode)})",
+                    f"chmod 600 {path}")
+    if mode & 0o044 and label != "allowlist":
+        rep.problem(f"{label} {path} is group/world-readable (mode {oct(mode)})",
+                    f"chmod 600 {path}")
+    try:
+        pst = path.parent.stat()
+    except OSError:
+        return
+    pmode = stat.S_IMODE(pst.st_mode)
+    if pmode & 0o002 and not pmode & stat.S_ISVTX:
+        rep.problem(f"directory {path.parent} is world-writable (mode {oct(pmode)}): "
+                    f"anyone can replace {path.name}", f"chmod 700 {path.parent}")
+
+
 def _check_users_db(rep: _Report, users_db: Path):
     import sqlite3
     if not users_db.exists():
         rep.problem(f"user store {users_db} does not exist")
         return
+    _check_private_perms(rep, users_db, "user store")
     try:
-        conn = sqlite3.connect(f"file:{users_db}?mode=ro", uri=True)
+        conn = sqlite3.connect(_db_uri(users_db, 'ro'), uri=True)
         try:
             meta = dict(conn.execute("SELECT key, value FROM auth_meta"))
             users = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
@@ -559,6 +592,7 @@ def _check_allow(rep: _Report, allow_arg: Optional[str], names: Optional[list]):
     except envload.AllowListError as exc:
         rep.problem(str(exc))
         return
+    _check_private_perms(rep, allow_path, "allowlist")
     rep.ok(f"allowlist {allow_path}: {len(allowed)} names")
     if names is None:
         return

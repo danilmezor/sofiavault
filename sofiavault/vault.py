@@ -353,27 +353,35 @@ class Vault:
         with self._lock:
             self._require_unlocked()
             self._require_writable()
-            self._sync()
-            self._require_untampered(live=True)
-            existing = get_entry_by_service(self._entries, service)
-            if existing is not None and not entry_row_exists(self._conn, existing.id):
-                # The row went away after this index was built (another
-                # writer deleted it). UPDATE-ing it would match nothing and
-                # silently lose the secret the caller asked us to store.
-                existing = None
-            if existing is None:
-                row_id = save_entry(self._conn, self._key, service, username,
-                                    password, url)
-            else:
-                payload = _load_entry_payload(self._conn, self._key, existing.id)
-                if payload is None:
-                    raise VaultCorrupted(
-                        f"entry '{service}' failed authenticated decryption; "
-                        "refusing to overwrite it"
-                    )
-                update_entry(self._conn, self._key, existing.id, service, username,
-                             url, password, payload.get('created_at', ''))
-                row_id = existing.id
+            # Hold the write lock across "is it there?" and the write, and
+            # only then re-sync the index: two processes deciding "absent"
+            # at the same moment used to both insert (review finding F8).
+            self._begin_write()
+            try:
+                self._sync()
+                self._require_untampered(live=True)
+                existing = get_entry_by_service(self._entries, service)
+                if existing is not None and not entry_row_exists(self._conn, existing.id):
+                    # The row went away after this index was built (another
+                    # writer deleted it). UPDATE-ing it would match nothing and
+                    # silently lose the secret the caller asked us to store.
+                    existing = None
+                if existing is None:
+                    row_id = save_entry(self._conn, self._key, service, username,
+                                        password, url)
+                else:
+                    payload = _load_entry_payload(self._conn, self._key, existing.id)
+                    if payload is None:
+                        raise VaultCorrupted(
+                            f"entry '{service}' failed authenticated decryption; "
+                            "refusing to overwrite it"
+                        )
+                    update_entry(self._conn, self._key, existing.id, service, username,
+                                 url, password, payload.get('created_at', ''))
+                    row_id = existing.id
+            except BaseException:
+                self._rollback()
+                raise
             self._reload()
             return row_id
 
@@ -385,12 +393,17 @@ class Vault:
         with self._lock:
             self._require_unlocked()
             self._require_writable()
-            self._sync()
-            self._require_untampered(live=True)
-            meta = get_entry_by_service(self._entries, service)
-            if meta is None:
-                raise EntryNotFound(service)
-            delete_entry(self._conn, meta.id, self._key)
+            self._begin_write()
+            try:
+                self._sync()
+                self._require_untampered(live=True)
+                meta = get_entry_by_service(self._entries, service)
+                if meta is None:
+                    raise EntryNotFound(service)
+                delete_entry(self._conn, meta.id, self._key)
+            except BaseException:
+                self._rollback()
+                raise
             self._reload()
 
     def list_entries(self) -> list[VaultEntry]:
@@ -520,6 +533,21 @@ class Vault:
     def _require_writable(self):
         if self.readonly:
             raise VaultReadOnly(f"{self.path} was opened read-only")
+
+    def _begin_write(self):
+        """Take SQLite's write lock for the duration of one mutation."""
+        if self._conn.in_transaction:
+            return
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+        except sqlite3.OperationalError as exc:
+            if 'readonly' in str(exc).lower():
+                raise VaultReadOnly(f"{self.path} is read-only: {exc}") from exc
+            raise VaultError(f"vault is busy: {exc}") from exc
+
+    def _rollback(self):
+        with contextlib.suppress(Exception):
+            self._conn.rollback()
 
     def _require_untampered(self, live: bool = False):
         # Writes pass live=True: they re-sign whatever the database holds

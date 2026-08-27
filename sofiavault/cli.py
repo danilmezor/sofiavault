@@ -33,6 +33,7 @@ from .generator import (
 )
 from .storage import (
     VaultEntry,
+    _db_uri,
     _is_vault_file,
     _load_entry_payload,
     _shred_file,
@@ -682,7 +683,7 @@ def cmd_import_vault(src: str) -> bool:
 
     # Prove ownership of the imported vault before touching anything
     password = get_master_password("Master password of the imported vault: ")
-    ro = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    ro = sqlite3.connect(_db_uri(path, 'ro'), uri=True)
     try:
         combined_salt, stored_hash = get_master_data(ro)
         key = verify_master_password(password, combined_salt, stored_hash,

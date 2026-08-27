@@ -54,6 +54,7 @@ from .core import (
     SALT_SIZE,
     derive_key,
 )
+from .storage import _db_uri
 
 AUTH_CONTEXT = b"sofiavault-auth-v1"
 AUTH_SCHEMA_VERSION = 2
@@ -120,6 +121,15 @@ _RAW_LENGTH_FACTOR = 8
 _MAX_TIME_COST = 12
 _MAX_MEMORY_COST = 1 << 20  # KiB, i.e. 1 GiB
 _MAX_PARALLELISM = 16
+
+#: The decoy is priced at the most expensive real row, but its Argon2 work
+#: (time_cost × memory_cost) is capped at this multiple of the defaults: one
+#: in-bounds row at (12, 1 GiB, 16) would otherwise make every login and every
+#: unknown-user probe pay ~64× (review finding F6). 16× still covers any
+#: deliberate operator configuration seen in practice (e.g. 8 passes over
+#: 256 MiB) so those rows stay padded; only a row beyond it is left
+#: unpadded, and it bounds what a tampered row can impose on everyone.
+_MAX_DECOY_MULTIPLIER = 16
 
 #: Shortest possible fields_enc blob: nonce + GCM tag. Anything shorter is
 #: truncated, and slicing it would reach AESGCM with a stub nonce, which
@@ -496,6 +506,11 @@ class UserStore:
                     # how a 1 TiB memory_cost would become a store-wide DoS.
                     continue
                 t, m, p = max(t, rt), max(m, rm), max(p, rp)
+            # Argon2 work ≈ time_cost × memory_cost; bound the product.
+            t = min(t, _MAX_DECOY_MULTIPLIER * ARGON2_TIME_COST)
+            budget = _MAX_DECOY_MULTIPLIER * ARGON2_TIME_COST * ARGON2_MEMORY_COST
+            if t * m > budget:
+                m = max(8 * p, budget // t)
             self._dummy_cost_cache = (t, m, p)
             self._dummy_cost_version = version
         return self._dummy_cost_cache
@@ -1324,7 +1339,7 @@ class UserStore:
         for ours, theirs in cols.items():
             if not re.match(r'^[A-Za-z_][A-Za-z0-9_]*$', str(theirs)):
                 raise AuthStoreError(f"invalid column name for {ours}: {theirs!r}")
-        src = sqlite3.connect(f"file:{Path(path)}?mode=ro", uri=True)
+        src = sqlite3.connect(_db_uri(Path(path), 'ro'), uri=True)
         try:
             have = {r[1] for r in src.execute(f"PRAGMA table_info({table})")}
             if not have:

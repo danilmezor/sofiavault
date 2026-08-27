@@ -396,3 +396,197 @@ def test_F_10_import_env_file_allowlist_does_not_bypass_the_denylist():
     assert envload._check_name("LD_PRELOAD", {"LD_PRELOAD"}, True) is True
     assert envload._check_name("DATABASE_URL", {"LD_PRELOAD"}, True) is False
     v.close()
+
+
+# ── F7: rekey takes the write lock before it reads the rows ─────────────────
+
+def test_F_7_rekey_holds_the_write_lock_before_selecting_rows(monkeypatch):
+    import threading
+    d = _tmp()
+    path = d / "s.db"
+    v = Vault.create(path, "pw-12345678")
+    for i in range(3):
+        v.set(f"svc{i}", str(i))
+    outcome = {}
+    real = storage._ensure_vault_id
+
+    def hooked(conn):
+        # Runs inside rekey_vault, after its BEGIN IMMEDIATE (fixed order):
+        # a concurrent writer must be locked out, not silently skipped.
+        def other():
+            c = sqlite3.connect(str(path), timeout=0.2)
+            try:
+                c.execute("INSERT INTO entries_v2 (salt, nonce, blob) VALUES (X'00', X'00', X'00')")
+                c.commit()
+                outcome["inserted"] = True
+            except sqlite3.OperationalError as exc:
+                outcome["error"] = str(exc)
+            finally:
+                c.close()
+        if "done" not in outcome:
+            outcome["done"] = True
+            t = threading.Thread(target=other)
+            t.start()
+            t.join()
+        return real(conn)
+
+    monkeypatch.setattr(storage, "_ensure_vault_id", hooked)
+    v.rekey(new_password="new-pw-12345678")
+    monkeypatch.undo()
+    assert "locked" in outcome.get("error", ""), outcome
+    v.close()
+    with Vault.open(path, password="new-pw-12345678") as again:
+        assert again.tampered is False and again.corrupt_count == 0
+        assert [again.get(f"svc{i}") for i in range(3)] == ["0", "1", "2"]
+
+
+# ── F8: concurrent set() of one service never creates a duplicate row ───────
+
+def test_F_8_concurrent_set_from_two_connections_updates_one_row(monkeypatch):
+    import threading
+    import time as _time
+    d = _tmp()
+    path = d / "s.db"
+    a = Vault.create(path, "pw-12345678")
+    b = Vault.open(path, password="pw-12345678")
+    from sofiavault import vault as vault_mod
+    real_save = vault_mod.save_entry
+    state = {}
+
+    def hooked(conn, key, service, *args, **kwargs):
+        # A has decided "no such service" and holds the write lock (fixed
+        # code). B now tries the same set(): it must block until A commits,
+        # then see A's row and update it rather than inserting its own.
+        if service == "shared" and "b" not in state:
+            state["b"] = threading.Thread(target=lambda: b.set("shared", "from-b"))
+            state["b"].start()
+            _time.sleep(0.5)
+            state["b_alive_while_a_writes"] = state["b"].is_alive()
+        return real_save(conn, key, service, *args, **kwargs)
+
+    monkeypatch.setattr(vault_mod, "save_entry", hooked)
+    a.set("shared", "from-a")
+    monkeypatch.undo()
+    state["b"].join(timeout=10)
+    assert state["b_alive_while_a_writes"] is True      # B was locked out
+    rows = sqlite3.connect(str(path)).execute("SELECT COUNT(*) FROM entries_v2").fetchone()[0]
+    assert rows == 1
+    assert a.get("shared") == "from-b" and b.get("shared") == "from-b"
+    assert a.tampered is False and b.tampered is False
+    a.close()
+    b.close()
+
+
+# ── F6: one expensive row must not price every login at its cost ───────────
+
+def test_F_6_decoy_cost_is_capped_at_a_small_multiple_of_the_defaults():
+    from sofiavault import auth
+    from sofiavault.core import ARGON2_MEMORY_COST, ARGON2_TIME_COST
+    d = _tmp()
+    path = d / "users.db"
+    with UserStore(path) as s:
+        s.add_user("alice", "alice-pw-1")
+    _sql(path, "UPDATE users SET time_cost = 12, memory_cost = 1048576, parallelism = 16")
+    with UserStore(path) as s:
+        t, m, p = s._dummy_costs()
+        assert t * m <= auth._MAX_DECOY_MULTIPLIER * ARGON2_TIME_COST * ARGON2_MEMORY_COST
+        assert t <= auth._MAX_DECOY_MULTIPLIER * ARGON2_TIME_COST
+        assert m <= auth._MAX_DECOY_MULTIPLIER * ARGON2_MEMORY_COST
+        # a modestly raised row still lifts the decoy (the original property)
+    _sql(path, "UPDATE users SET time_cost = 4, memory_cost = 65536, parallelism = 4")
+    with UserStore(path) as s:
+        assert s._dummy_costs() == (4, 65536, 4)
+
+
+# ── F12: doctor looks at real permissions, not os.access ────────────────────
+
+@pytest.mark.skipif(os.name != "posix" or os.geteuid() == 0, reason="file modes")
+def test_F_12_doctor_flags_world_writable_files_and_dirs(monkeypatch, capsys):
+    d = _tmp()
+    monkeypatch.setattr(paths, "DB_PATH", d / "unused.db")
+    monkeypatch.setattr(paths, "DB_PATH_FROM_ENV", False)
+    monkeypatch.setattr(paths, "USERS_DB_PATH", d / "users.db")
+    monkeypatch.setattr(paths, "USERS_DB_PATH_FROM_ENV", False)
+    monkeypatch.setattr(paths, "ALLOW_FILE", None)
+    for var in ("SOFIAVAULT_KEY", "SOFIAVAULT_PASSWORD", "SOFIAVAULT_ALLOW_FILE"):
+        monkeypatch.delenv(var, raising=False)
+    vault = d / "secrets.db"
+    v = Vault.create(vault, "pw-12345678")
+    v.set("env:a", "1")
+    key_file = d / "vault.key"
+    cli_server.write_key_file(key_file, v.export_key())
+    v.close()
+    allow = d / "allow"
+    allow.write_text("A\n")
+    monkeypatch.setenv("SOFIAVAULT_KEY_FILE", str(key_file))
+    with UserStore(d / "users.db") as s:          # default users.db, no fields key
+        s.add_user("alice", "alice-pw-1")
+
+    def doctor():
+        code = cli_server.main(["doctor", "--vault", str(vault), "--allow", str(allow)])
+        return code, capsys.readouterr().out
+
+    code, out = doctor()
+    assert code == 0, out
+    assert "no fields key" in out                       # default users.db is checked
+
+    for target in (vault, allow, d / "users.db"):
+        os.chmod(target, 0o666)
+        code, out = doctor()
+        assert code == 1 and str(target) in out and "0o666" in out, out
+        os.chmod(target, 0o600)
+    os.chmod(d, 0o777)
+    code, out = doctor()
+    os.chmod(d, 0o700)
+    assert code == 1 and "world-writable" in out, out
+
+    # a check that could not run is reported, not silently skipped
+    monkeypatch.setenv("SOFIAVAULT_KEY_FILE", str(d / "missing.key"))
+    code, out = doctor()
+    assert code == 1 and "MAC" in out and ("skipped" in out or "not checked" in out), out
+    # SOFIAVAULT_KEY in the environment is rated like SOFIAVAULT_PASSWORD
+    monkeypatch.delenv("SOFIAVAULT_KEY_FILE")
+    monkeypatch.setenv("SOFIAVAULT_KEY", "x")
+    code, out = doctor()
+    assert "warning  key source: SOFIAVAULT_KEY" in out
+
+
+# ── F13: every read-only open goes through _db_uri ──────────────────────────
+
+def test_F_13_read_only_opens_survive_question_marks_in_the_path(monkeypatch):
+    from sofiavault import cli
+    d = _tmp() / "odd?dir#1"
+    d.mkdir()
+    vault = d / "what?.db"
+    Vault.create(vault, "pw-12345678").close()
+    before = sorted(os.listdir(d))
+    assert storage._is_vault_file(vault) is True
+    assert storage.is_legacy_vault_file(vault) is False
+    with Vault.open(vault, password="pw-12345678", readonly=True) as v:
+        assert v.readonly
+    # cmd_import_vault's ownership probe
+    monkeypatch.setattr(paths, "DB_PATH", d / "other.db")
+    monkeypatch.setattr(cli, "get_master_password", lambda *a, **k: "wrong")
+    assert cli.cmd_import_vault(str(vault)) is False
+    # doctor's users-db probe and import_sqlite's source open
+    users = d / "u?.db"
+    with UserStore(users) as s:
+        s.add_user("alice", "alice-pw-1")
+    rep = cli_server._Report()
+    cli_server._check_users_db(rep, users)
+    assert not rep.problems, rep.lines
+    src = d / "legacy?.db"
+    c = sqlite3.connect(str(src))
+    c.execute("CREATE TABLE m (username TEXT, password_hash TEXT)")
+    c.execute("INSERT INTO m VALUES ('bob', 'h')")
+    c.commit()
+    c.close()
+    with UserStore(users) as s:
+        assert s.import_sqlite(src, "m", scheme="fake")[0] == ["bob"]
+    assert set(os.listdir(d)) == set(before) | {"legacy?.db", "u?.db"}
+    assert "file:" not in str(list(d.iterdir()))
+    import re
+    src_text = "".join(Path(f).read_text() for f in [
+        "sofiavault/storage.py", "sofiavault/auth.py", "sofiavault/cli.py",
+        "sofiavault/cli_server.py"])
+    assert not re.search(r'f"file:\{', src_text), "hand-built sqlite URIs remain"
