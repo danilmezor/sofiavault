@@ -2,7 +2,7 @@
 
 All notable changes to SofiaVault will be documented in this file.
 
-## [0.4.0] - unreleased
+## [0.4.0] - 2026-08-26
 
 The first real server integration of 0.3.0 found every gap forced a
 workaround in the consuming app. 0.4.0 closes them: everything about
