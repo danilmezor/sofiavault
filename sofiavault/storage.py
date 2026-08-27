@@ -39,6 +39,10 @@ from .core import (
 #: entry-set MAC.
 SCHEMA_VERSION = 4
 
+#: Every vault at or above this version is required to carry an entry-set
+#: MAC; a missing one is tamper evidence, never something to adopt.
+MAC_MANDATORY_VERSION = 3
+
 #: Columns added to `master` by schema v4. Nullable so a v3 row can be
 #: adopted in place; NULL means "the constants this build was compiled with".
 _MASTER_COST_COLUMNS = ('time_cost', 'memory_cost', 'parallelism')
@@ -332,7 +336,10 @@ def verify_entries_mac(conn: sqlite3.Connection, key: bytes) -> bool:
     cur = conn.execute("SELECT value FROM vault_meta WHERE key = 'entries_mac'")
     row = cur.fetchone()
     if row is None or not row[0]:
-        if get_schema_version(conn) >= SCHEMA_VERSION:
+        # MACs became mandatory at v3. This is a literal on purpose: when
+        # SCHEMA_VERSION moved to 4, a `>= SCHEMA_VERSION` test here quietly
+        # re-adopted every stripped v3 vault (review finding F1).
+        if get_schema_version(conn) >= MAC_MANDATORY_VERSION:
             return False
         refresh_entries_mac(conn, key)
         return True
