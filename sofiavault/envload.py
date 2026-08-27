@@ -159,7 +159,8 @@ UNSAFE_SUFFIXES = (
 )
 
 #: Bootstrap credentials that must never be inherited by an exec'd child.
-BOOTSTRAP_VARS = ('SOFIAVAULT_KEY', 'SOFIAVAULT_PASSWORD', 'SOFIAVAULT_KEY_FILE')
+BOOTSTRAP_VARS = ('SOFIAVAULT_KEY', 'SOFIAVAULT_PASSWORD', 'SOFIAVAULT_KEY_FILE',
+                  'SOFIAVAULT_FIELDS_KEY', 'SOFIAVAULT_FIELDS_KEY_FILE', 'SOFIAVAULT_PEPPER')
 
 
 class UnsafeVariableName(ValueError):
@@ -224,7 +225,7 @@ def load_allowlist(path: Union[str, Path]) -> AllowList:
     except (OSError, UnicodeDecodeError) as exc:
         raise AllowListError(f"cannot read allowlist {path}: {exc}") from exc
     names = set()
-    for lineno, raw in enumerate(text.splitlines(), 1):
+    for lineno, raw in enumerate(_split_lines(text), 1):
         line = raw.split('#', 1)[0].strip()
         if not line:
             continue
@@ -236,6 +237,18 @@ def load_allowlist(path: Union[str, Path]) -> AllowList:
     if not names:
         raise AllowListError(f"allowlist {path} names no variables")
     return AllowList(names, path)
+
+
+def _split_lines(text: str) -> list:
+    """Split on "\n" only (tolerating "\r\n").
+
+    str.splitlines() also breaks on VT, FF, FS, GS, RS, NEL, LS and PS —
+    none of which an editor, `wc -l` or a reviewer's eye treats as a line
+    break — so a second name could ride inside what reads as one line
+    (review finding F4). Such characters now stay inside the line and fail
+    name validation instead.
+    """
+    return [line[:-1] if line.endswith('\r') else line for line in text.split('\n')]
 
 
 def _resolve_allow(allow: Optional[Iterable[str]],
@@ -291,8 +304,9 @@ def _normalize_allow(allow: Optional[Iterable[str]]) -> Optional[set]:
 
 def _check_name(name: str, allowed: Optional[set], allow_unsafe_names: bool) -> bool:
     """Apply whichever gate is in force to one name being stored/injected."""
-    if allowed is not None:
-        return name.upper() in allowed
+    # The allowlist narrows; it never admits a loader variable on its own.
+    if allowed is not None and name.upper() not in allowed:
+        return False
     return allow_unsafe_names or is_safe_name(name)
 
 
@@ -471,7 +485,7 @@ def _iter_env_pairs(text: str):
     `load(allow=[...])` is the gate that bounds the damage regardless of
     how any file parses.
     """
-    lines = text.splitlines()
+    lines = _split_lines(text)
     i = 0
     while i < len(lines):
         line = lines[i].strip()

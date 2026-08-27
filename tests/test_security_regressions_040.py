@@ -323,3 +323,76 @@ def test_F_9_import_backup_does_not_follow_a_symlink(monkeypatch):
     with Vault.open(home / "vault.db", password="incoming-pw-12345") as v:
         assert v.get("env:new") == "new"
     assert oct((home / "vault.db").stat().st_mode & 0o777) == "0o600"
+
+
+# ── F4: line splitting — only "\n" (and "\r\n") separate names ──────────────
+
+_ODD_SEPARATORS = ["\x0b", "\x0c", "\x1c", "\x1d", "\x1e", "\x85", " ", " "]
+
+
+@pytest.mark.parametrize("sep", _ODD_SEPARATORS)
+def test_F_4_allowlist_rejects_names_smuggled_past_wc_l(sep):
+    d = _tmp()
+    f = d / "allow"
+    f.write_text(f"DATABASE_URL{sep}LD_PRELOAD\n", encoding="utf-8")
+    with pytest.raises(envload.AllowListError):
+        envload.load_allowlist(f)
+    f.write_text("DATABASE_URL\r\nAPI_KEY\r\n", encoding="utf-8")   # CRLF is fine
+    assert envload.load_allowlist(f) == {"DATABASE_URL", "API_KEY"}
+
+
+@pytest.mark.parametrize("sep", _ODD_SEPARATORS)
+def test_F_4_env_import_does_not_split_on_exotic_separators(sep):
+    pairs = list(envload._iter_env_pairs(f"FOO=bar{sep}GIT_SSH_COMMAND=evil\nNEXT=1\n"))
+    names = [n for n, _ in pairs]
+    assert "GIT_SSH_COMMAND" not in names
+    assert names[-1] == "NEXT"
+    assert list(envload._iter_env_pairs("A=1\r\nB=2\r\n")) == [("A", "1"), ("B", "2")]
+
+
+# ── F5: every SOFIAVAULT_* bootstrap credential is stripped before exec ─────
+
+def test_F_5_fields_key_and_pepper_never_reach_the_child(monkeypatch):
+    for var in ("SOFIAVAULT_FIELDS_KEY", "SOFIAVAULT_FIELDS_KEY_FILE", "SOFIAVAULT_PEPPER",
+                "SOFIAVAULT_KEY", "SOFIAVAULT_PASSWORD", "SOFIAVAULT_KEY_FILE"):
+        assert var in envload.BOOTSTRAP_VARS, var
+        assert envload.is_safe_name(var) is False
+    d = _tmp()
+    vault = d / "s.db"
+    Vault.create(vault, "pw-12345678").close()
+    import json
+    import subprocess
+    env = {k: v for k, v in os.environ.items() if not k.startswith("SOFIAVAULT_")}
+    env.update(SOFIAVAULT_PASSWORD="pw-12345678", SOFIAVAULT_PEPPER="pepper",
+               SOFIAVAULT_FIELDS_KEY="AAAA", SOFIAVAULT_FIELDS_KEY_FILE="/nope",
+               HOME=str(d))
+    proc = subprocess.run(
+        [sys.executable, "-m", "sofiavault.cli", "run", "--vault", str(vault), "--",
+         sys.executable, "-c", "import os, json; print(json.dumps(dict(os.environ)))"],
+        capture_output=True, text=True, env=env, cwd=Path(__file__).resolve().parent.parent,
+        timeout=60)
+    assert proc.returncode == 0, proc.stderr
+    child = json.loads(proc.stdout)
+    assert not [k for k in child if k.startswith("SOFIAVAULT_")], child
+
+
+# ── F10: an allowlist never admits a denylisted name on import either ───────
+
+def test_F_10_import_env_file_allowlist_does_not_bypass_the_denylist():
+    d = _tmp()
+    vault = d / "s.db"
+    v = Vault.create(vault, "pw-12345678")
+    env_file = d / "app.env"
+    env_file.write_text("LD_PRELOAD=/tmp/evil.so\nDATABASE_URL=postgres://x\n")
+    imported, skipped, rejected = envload.import_env_file(
+        v, env_file, allow=["LD_PRELOAD", "DATABASE_URL"])
+    assert imported == ["DATABASE_URL"] and "LD_PRELOAD" in rejected
+    assert envload.list_env_entries(v) == ["DATABASE_URL"]
+    # explicit opt-in still works, as for load()
+    imported, _, rejected = envload.import_env_file(
+        v, env_file, allow=["LD_PRELOAD"], allow_unsafe_names=True, overwrite=True)
+    assert imported == ["LD_PRELOAD"]
+    assert envload._check_name("LD_PRELOAD", {"LD_PRELOAD"}, False) is False
+    assert envload._check_name("LD_PRELOAD", {"LD_PRELOAD"}, True) is True
+    assert envload._check_name("DATABASE_URL", {"LD_PRELOAD"}, True) is False
+    v.close()
