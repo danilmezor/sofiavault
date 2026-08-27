@@ -62,16 +62,25 @@ def test_T_10_3_second_token_invalidates_the_first():
 
 
 def test_T_10_4_redeem_clears_legacy_hash_and_stamps_password_changed_at():
-    s, path = _store()
-    conn = sqlite3.connect(str(path))
-    conn.execute("UPDATE users SET legacy_hash = 'fake$abc', password_changed_at = '2000-01-01'")
-    conn.commit()
-    conn.close()
+    d = Path(tempfile.mkdtemp())
+    src = d / "legacy.db"
+    c = sqlite3.connect(str(src))
+    c.execute("CREATE TABLE m (username TEXT, password_hash TEXT)")
+    c.execute("INSERT INTO m VALUES ('alice', 'abc')")
+    c.commit()
+    c.close()
+    s = UserStore(d / "users.db", fields_key=KEY)
+    s.import_sqlite(src, "m", scheme="fake")
+    row = sqlite3.connect(str(d / "users.db")).execute(
+        "SELECT legacy_hash, password_changed_at FROM users").fetchone()
+    assert row[0] == "fake$abc"
+    imported_at = row[1]
+    time.sleep(1.1)   # timestamps have second resolution
     token = s.reset_token_issue("alice")
     assert s.reset_token_redeem(token, "new-password-2") == "alice"
-    row = sqlite3.connect(str(path)).execute(
+    row = sqlite3.connect(str(d / "users.db")).execute(
         "SELECT legacy_hash, password_changed_at FROM users").fetchone()
-    assert row[0] is None and row[1] != "2000-01-01"
+    assert row[0] is None and row[1] != imported_at
     assert s.verify("alice", "new-password-2").password_changed_at == row[1]
     s.close()
 

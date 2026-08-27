@@ -46,8 +46,10 @@ sessions and policy.
   `import_sqlite`) that upgrade bcrypt-style hashes to Argon2id on first
   login instead of forcing a mass reset. `AuthResult` gains `role`,
   `is_admin`, `is_active`, `totp`, `password_changed_at`. On a store with
-  `fields_key` the typed flags carry a keyed HMAC (`flags_tag`) checked by
-  `verify()`/`get_user()`, so a SQL write cannot grant admin. v1 stores
+  `fields_key` every credential row carries a keyed HMAC (`row_tag`, bound
+  to a per-store `store_id`) checked before the password is examined, so a
+  SQL write cannot grant admin, switch MFA off, replay a code, swap password
+  material or transplant a row between stores sharing a key. v1 stores
   migrate in place in one transaction (an encrypting v1 store needs its
   key for that one open).
 - **Auth CLI**: `auth import-json`, `import-sqlite --table --scheme [--map]`,

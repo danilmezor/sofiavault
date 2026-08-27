@@ -149,12 +149,13 @@ def test_T_7_5_typed_flags_are_queryable_without_decrypting_fields():
         assert s2.list_users(admin_only=True) == ["alice"]
         with pytest.raises(AuthStoreError):
             s2.get_user("alice")     # fields need the key; flags do not
-    # sqlite-level: is_admin tampered to the *string* "yes" is not admin
+    # sqlite-level: is_admin tampered (even to the *string* "yes") is not a
+    # quiet False any more — the row MAC makes it FieldsTampered
     conn = sqlite3.connect(str(path))
     conn.execute("UPDATE users SET is_admin = 'yes' WHERE username='bob'")
     conn.commit()
-    with UserStore(path, fields_key=KEY) as s:
-        assert s.verify("bob", "pw-bob-1").is_admin is False
+    with UserStore(path, fields_key=KEY) as s, pytest.raises(FieldsTampered):
+        s.verify("bob", "pw-bob-1")
 
 
 # ── typed flags are tamper-evident under fields_key (security review fix) ──
@@ -180,7 +181,7 @@ def test_T_7_6_typed_flags_cannot_be_forged_by_writing_the_db():
     for stmt in ("UPDATE users SET is_admin = 1 WHERE username = 'mallory'",
                  "UPDATE users SET role = 'admin' WHERE username = 'mallory'",
                  "UPDATE users SET is_active = 1 WHERE username = 'mallory'",
-                 "UPDATE users SET flags_tag = NULL WHERE username = 'mallory'"):
+                 "UPDATE users SET row_tag = NULL WHERE username = 'mallory'"):
         before = path.read_bytes()
         _sql(path, "UPDATE users SET is_active = 1 WHERE username = 'mallory'")
         _sql(path, stmt)
@@ -208,9 +209,9 @@ def test_T_7_7_flag_tags_are_bound_to_the_user_and_absent_without_a_key():
         s.set_admin("root", True)
         s.add_user("mallory", "mallory-pw-1")
     conn = sqlite3.connect(str(path))
-    root_tag = conn.execute("SELECT flags_tag FROM users WHERE username='root'").fetchone()[0]
+    root_tag = conn.execute("SELECT row_tag FROM users WHERE username='root'").fetchone()[0]
     assert isinstance(root_tag, bytes) and len(root_tag) == 32
-    conn.execute("UPDATE users SET is_admin = 1, flags_tag = ? WHERE username = 'mallory'",
+    conn.execute("UPDATE users SET is_admin = 1, row_tag = ? WHERE username = 'mallory'",
                  (root_tag,))
     conn.commit()
     conn.close()
@@ -227,7 +228,7 @@ def test_T_7_7_flag_tags_are_bound_to_the_user_and_absent_without_a_key():
         s.add_user("alice", "alice-pw-1")
         s.set_admin("alice", True)
     assert sqlite3.connect(str(plain)).execute(
-        "SELECT flags_tag FROM users").fetchone()[0] is None
+        "SELECT row_tag FROM users").fetchone()[0] is None
     with UserStore(plain) as s:
         assert s.verify("alice", "alice-pw-1").is_admin is True
 
@@ -259,7 +260,7 @@ def test_v1_encrypting_store_migration_tags_rows_and_needs_the_key():
     with UserStore(path, fields_key=KEY) as s:
         r = s.verify("alice", "alice-pw-1")
         assert r is not None and r.fields == {"team": "ops"} and r.is_admin is False
-    tag = sqlite3.connect(str(path)).execute("SELECT flags_tag FROM users").fetchone()[0]
+    tag = sqlite3.connect(str(path)).execute("SELECT row_tag FROM users").fetchone()[0]
     assert isinstance(tag, bytes) and len(tag) == 32
     # ...and once migrated, the keyless open works for index queries again
     with UserStore(path) as s:

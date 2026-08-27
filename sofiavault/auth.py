@@ -69,9 +69,10 @@ _V2_COLUMNS = (
     ("recovery_enc", "BLOB"),
     ("legacy_hash", "TEXT"),
     ("password_changed_at", "TEXT NOT NULL DEFAULT ''"),
-    # HMAC over (username, role, is_admin, is_active) under fields_key, so the
-    # plaintext policy columns are as tamper-evident as the encrypted fields.
-    ("flags_tag", "BLOB"),
+    # HMAC over the whole credential row (see _row_tag) under fields_key and
+    # the store id, so no column a DB writer can reach changes what verify()
+    # says, and no row transplants between stores sharing a key.
+    ("row_tag", "BLOB"),
 )
 
 _ROW_COLUMNS = (
@@ -328,6 +329,7 @@ class UserStore:
         # the typed "needs write access to migrate" error, not a raw sqlite
         # error from an unrelated CREATE TABLE.
         self._migrate_v1_to_v2()
+        self._store_id = self._ensure_store_id()
         self._conn.execute("""
             CREATE TABLE IF NOT EXISTS reset_tokens (
                 username TEXT PRIMARY KEY,
@@ -354,6 +356,17 @@ class UserStore:
             self._dummy_salt = bytes.fromhex(row[0])
         self._init_fields_policy()
         self._conn.commit()
+
+    def _ensure_store_id(self) -> str:
+        """A random per-store identity, mixed into every tag and MFA AAD."""
+        self._conn.execute(
+            "INSERT OR IGNORE INTO auth_meta (key, value) VALUES ('store_id', ?)",
+            (secrets.token_hex(16),))
+        row = self._conn.execute(
+            "SELECT value FROM auth_meta WHERE key = 'store_id'").fetchone()
+        if row is None or not isinstance(row[0], str) or not row[0]:
+            raise AuthStoreError("auth_meta.store_id is missing or malformed")
+        return row[0]
 
     def _schema_version(self) -> int:
         row = self._conn.execute(
@@ -399,12 +412,10 @@ class UserStore:
                 "UPDATE users SET password_changed_at = updated_at "
                 "WHERE password_changed_at = ''")
             if encrypting:
-                rows = self._conn.execute("SELECT username, is_active FROM users").fetchall()
-                for username, is_active in rows:
-                    self._conn.execute(
-                        "UPDATE users SET flags_tag = ? WHERE username = ?",
-                        (self._flags_tag(username, '', False, _is_truthy_active(is_active)),
-                         username))
+                self._store_id = self._ensure_store_id()
+                self._fields_encrypted = True
+                for (username,) in self._conn.execute("SELECT username FROM users").fetchall():
+                    self._retag(username)
             self._conn.execute(
                 "INSERT OR REPLACE INTO auth_meta (key, value) VALUES ('schema_version', ?)",
                 (str(AUTH_SCHEMA_VERSION),))
@@ -521,51 +532,72 @@ class UserStore:
         """
         return AUTH_CONTEXT + b"|" + username.encode('utf-8')
 
-    @staticmethod
-    def _mfa_aad(username: str, label: bytes) -> bytes:
+    def _mfa_aad(self, username: str, label: bytes) -> bytes:
         """AAD for TOTP seeds / recovery tags: a distinct label per slot so a
         seed blob cannot be transplanted into the fields slot or vice versa."""
-        return AUTH_CONTEXT + b"|" + username.encode('utf-8') + b"|" + label
+        return b"|".join([AUTH_CONTEXT, self._store_id.encode('ascii'),
+                          username.encode('utf-8'), label])
 
-    def _flags_tag(self, username: str, role: str, is_admin: bool, is_active: bool) -> bytes:
-        """Keyed tag binding the typed flags to one user of this store."""
-        msg = b"|".join([AUTH_CONTEXT, username.encode('utf-8'), b"flags",
-                         role.encode('utf-8'), b"1" if is_admin else b"0",
-                         b"1" if is_active else b"0"])
-        return hmac.new(self._require_fields_key(), msg, hashlib.sha256).digest()
+    def _row_tag(self, row: dict) -> bytes:
+        """HMAC over every column of a credential row, under fields_key.
 
-    def _flags_tag_for(self, username: str, role: str, is_admin: bool,
-                       is_active: bool) -> Optional[bytes]:
-        """The tag to store: None on a plaintext-policy store, else required."""
+        Length-prefixed so no two rows encode to the same message; the
+        large blobs go in hashed. The store id is in the message, so a row
+        copied from another store sharing the key is rejected (F2), and so
+        are edits to any column a DB writer could otherwise use to disable
+        MFA, replay a code, swap password material or revive an account (F3).
+        """
+        def part(value) -> bytes:
+            if value is None:
+                return b"N"
+            if isinstance(value, (bytes, bytearray)):
+                data = b"H" + hashlib.sha256(bytes(value)).digest()
+            else:
+                data = b"S" + str(value).encode('utf-8')
+            return b"%d:" % len(data) + data
+        message = b"".join(part(v) for v in (
+            self._store_id, row['username'], row['salt'], row['verify_hash'],
+            row['time_cost'], row['memory_cost'], row['parallelism'],
+            row['fields'], row['fields_enc'], row['is_active'],
+            row['role'], row['is_admin'], row['totp_enc'], row['totp_counter'],
+            row['totp_confirmed'], row['recovery_enc'], row['legacy_hash'],
+            row['password_changed_at'],
+        ))
+        return hmac.new(self._require_fields_key(), b"row|" + message,
+                        hashlib.sha256).digest()
+
+    def _retag(self, username: str):
+        """Recompute a row's tag after any write, inside the caller's transaction."""
         if not self._fields_encrypted:
-            return None
+            return
         if self._fields_key is None:
             raise AuthStoreError(
                 "this store encrypts profile fields; construct UserStore with fields_key"
             )
-        return self._flags_tag(username, role, is_admin, is_active)
+        row = self._row(username)
+        if row is None:
+            return
+        self._conn.execute("UPDATE users SET row_tag = ? WHERE username = ?",
+                           (self._row_tag(row), username))
 
-    def _check_flags(self, row: dict):
-        """Raise FieldsTampered if the typed flags were not written by this store.
+    def _check_row(self, row: dict):
+        """Raise FieldsTampered unless this store wrote the row as it stands.
 
         Only an encrypting store carries tags; on a plaintext-policy store the
-        flags are as unauthenticated as the rest of the row (documented).
+        row is as unauthenticated as its file (documented in SECURITY.md).
         """
         if not self._fields_encrypted:
             return
         if self._fields_key is None:
             raise AuthStoreError(
-                "profile flags are authenticated; construct UserStore with fields_key"
+                "credential rows are authenticated; construct UserStore with fields_key"
             )
-        role = row['role'] if isinstance(row['role'], str) else None
-        stored = row['flags_tag']
-        if role is None or not isinstance(stored, (bytes, bytearray)):
-            raise FieldsTampered(f"flags for {row['username']!r} failed authentication")
-        expected = self._flags_tag(row['username'], role,
-                                   _is_truthy_active(row['is_admin']),
-                                   _is_truthy_active(row['is_active']))
-        if not hmac.compare_digest(bytes(stored), expected):
-            raise FieldsTampered(f"flags for {row['username']!r} failed authentication")
+        stored = row['row_tag']
+        if not isinstance(stored, (bytes, bytearray)) or \
+                not hmac.compare_digest(bytes(stored), self._row_tag(row)):
+            raise FieldsTampered(
+                f"credential row for {row['username']!r} failed authentication"
+            )
 
     def _require_fields_key(self) -> bytes:
         if self._fields_key is None:
@@ -707,18 +739,18 @@ class UserStore:
                 # only way in until the first successful login rewrites it.
                 verify_hash = secrets.token_bytes(KEY_SIZE)
             fields_text, fields_enc = self._encode_fields(fields, username)
-            flags_tag = self._flags_tag_for(username, role, bool(is_admin), bool(is_active))
             now = _utcnow()
             try:
                 self._conn.execute(
                     "INSERT INTO users (username, salt, verify_hash, time_cost, memory_cost,"
                     " parallelism, fields, fields_enc, is_active, created_at, updated_at,"
-                    " role, is_admin, legacy_hash, password_changed_at, flags_tag)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    " role, is_admin, legacy_hash, password_changed_at)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (username, salt, verify_hash, ARGON2_TIME_COST, ARGON2_MEMORY_COST,
                      ARGON2_PARALLELISM, fields_text, fields_enc, 1 if is_active else 0,
-                     now, now, role, 1 if is_admin else 0, legacy_hash, now, flags_tag)
+                     now, now, role, 1 if is_admin else 0, legacy_hash, now)
                 )
+                self._retag(username)
                 self._conn.commit()
             except sqlite3.IntegrityError:
                 # Another writer took the name between the check and the
@@ -734,8 +766,10 @@ class UserStore:
         _require_password(password)
         username = normalize_username(username)
         with self._lock:
-            if self._row(username) is None:
+            row = self._row(username)
+            if row is None:
                 return False
+            self._check_row(row)
             self._write_password(username, password, (ARGON2_TIME_COST,
                                                       ARGON2_MEMORY_COST,
                                                       ARGON2_PARALLELISM),
@@ -765,6 +799,7 @@ class UserStore:
             (salt, verify_hash, time_cost, memory_cost, parallelism, now)
             + ((now,) if changed else ()) + (username,)
         )
+        self._retag(username)
         if commit:
             self._conn.commit()
         self._dummy_cost_cache = None
@@ -773,14 +808,17 @@ class UserStore:
         """Replace a user's profile fields. Returns False if unknown."""
         username = normalize_username(username)
         with self._lock:
-            if self._row(username) is None:
+            row = self._row(username)
+            if row is None:
                 return False
+            self._check_row(row)
             fields_text, fields_enc = self._encode_fields(fields, username)
             self._conn.execute(
                 "UPDATE users SET fields = ?, fields_enc = ?, updated_at = ?"
                 " WHERE username = ?",
                 (fields_text, fields_enc, _utcnow(), username)
             )
+            self._retag(username)
             self._conn.commit()
             return True
 
@@ -812,18 +850,18 @@ class UserStore:
             row = self._row(username)
             if row is None:
                 return False
-            self._check_flags(row)
+            self._check_row(row)
             new_role = role if role is not None else (
                 row['role'] if isinstance(row['role'], str) else '')
             new_admin = is_admin if is_admin is not None else _is_truthy_active(row['is_admin'])
             new_active = is_active if is_active is not None else \
                 _is_truthy_active(row['is_active'])
             self._conn.execute(
-                "UPDATE users SET role = ?, is_admin = ?, is_active = ?, flags_tag = ?,"
+                "UPDATE users SET role = ?, is_admin = ?, is_active = ?,"
                 " updated_at = ? WHERE username = ?",
                 (new_role, 1 if new_admin else 0, 1 if new_active else 0,
-                 self._flags_tag_for(username, new_role, new_admin, new_active),
                  _utcnow(), username))
+            self._retag(username)
             self._conn.commit()
             return True
 
@@ -854,7 +892,7 @@ class UserStore:
             row = self._row(username)
             if row is None:
                 return None
-            self._check_flags(row)
+            self._check_row(row)
             return {
                 'username': row['username'],
                 'fields': self._decode_fields(row['fields'], row['fields_enc'],
@@ -916,6 +954,11 @@ class UserStore:
                 self._burn_dummy_hash(password)
                 return None
             row = self._row(name)
+            if row is not None:
+                # Before the password is even looked at: a tampered row is not
+                # input, it is an attack on the store, and it must never be
+                # probed with Argon2 work or answered with a result.
+                self._check_row(row)
             if row is None or not _is_truthy_active(row['is_active']):
                 self._burn_dummy_hash(password)
                 return None
@@ -955,7 +998,6 @@ class UserStore:
             return self._result(row)
 
     def _result(self, row: dict) -> AuthResult:
-        self._check_flags(row)
         return AuthResult(
             username=row['username'],
             fields=self._decode_fields(row['fields'], row['fields_enc'],
@@ -1007,13 +1049,16 @@ class UserStore:
         self._require_fields_key()
         secret = _totp.generate_secret()
         with self._lock:
-            if self._row(username) is None:
+            row = self._row(username)
+            if row is None:
                 raise AuthStoreError(f"unknown user {username!r}")
+            self._check_row(row)
             self._conn.execute(
                 "UPDATE users SET totp_enc = ?, totp_counter = -1, totp_confirmed = 0,"
                 " recovery_enc = NULL, updated_at = ? WHERE username = ?",
                 (self._seal(secret.encode('ascii'), username, b"totp"), _utcnow(),
                  username))
+            self._retag(username)
             self._conn.commit()
         return secret
 
@@ -1041,7 +1086,10 @@ class UserStore:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
                 row = self._row(username)
-                if row is None or row['totp_enc'] is None:
+                if row is None:
+                    return False
+                self._check_row(row)
+                if row['totp_enc'] is None:
                     return False
                 confirmed = _is_truthy_active(row['totp_confirmed'])
                 if confirm == confirmed:
@@ -1058,6 +1106,7 @@ class UserStore:
                     "UPDATE users SET totp_counter = ?, totp_confirmed = 1, updated_at = ?"
                     " WHERE username = ? AND totp_counter = ?",
                     (accepted, _utcnow(), username, last))
+                self._retag(username)
                 return True
             finally:
                 # commit on success, rollback otherwise — a refused code must
@@ -1072,6 +1121,7 @@ class UserStore:
                 "UPDATE users SET totp_enc = NULL, totp_counter = -1, totp_confirmed = 0,"
                 " recovery_enc = NULL, updated_at = ? WHERE username = ?",
                 (_utcnow(), username))
+            self._retag(username)
             self._conn.commit()
             return cur.rowcount > 0
 
@@ -1080,8 +1130,9 @@ class UserStore:
         username = normalize_username(username)
         with self._lock:
             row = self._row(username)
-        if row is None:
-            raise AuthStoreError(f"unknown user {username!r}")
+            if row is None:
+                raise AuthStoreError(f"unknown user {username!r}")
+            self._check_row(row)
         return _totp_status(row)
 
     # ── Recovery codes ───────────────────────────────────────────────────
@@ -1101,12 +1152,15 @@ class UserStore:
             codes.append(raw[:5] + "-" + raw[5:])
         tags = [self._tag(_normalize_recovery_code(c)).hex() for c in codes]
         with self._lock:
-            if self._row(username) is None:
+            row = self._row(username)
+            if row is None:
                 raise AuthStoreError(f"unknown user {username!r}")
+            self._check_row(row)
             self._conn.execute(
                 "UPDATE users SET recovery_enc = ?, updated_at = ? WHERE username = ?",
                 (self._seal(json.dumps(tags).encode('ascii'), username, b"recovery"),
                  _utcnow(), username))
+            self._retag(username)
             self._conn.commit()
         return codes
 
@@ -1137,6 +1191,7 @@ class UserStore:
                 row = self._row(username)
                 if row is None:
                     return False
+                self._check_row(row)
                 tags = self._recovery_tags(row, username)
                 # Compare against every tag so timing does not leak the index.
                 matched = [i for i, t in enumerate(tags)
@@ -1148,6 +1203,7 @@ class UserStore:
                     "UPDATE users SET recovery_enc = ?, updated_at = ? WHERE username = ?",
                     (self._seal(json.dumps(tags).encode('ascii'), username, b"recovery"),
                      _utcnow(), username))
+                self._retag(username)
                 return True
             finally:
                 self._conn.commit()
@@ -1158,6 +1214,7 @@ class UserStore:
             row = self._row(username)
             if row is None:
                 raise AuthStoreError(f"unknown user {username!r}")
+            self._check_row(row)
             if row['recovery_enc'] is None:
                 return 0
             return len(self._recovery_tags(row, username))
@@ -1176,15 +1233,23 @@ class UserStore:
         self._require_fields_key()
         token = secrets.token_urlsafe(32)
         now = time.time()
+        expires_at = now + float(ttl_seconds)
         with self._lock:
-            if self._row(username) is None:
+            row = self._row(username)
+            if row is None:
                 raise AuthStoreError(f"unknown user {username!r}")
+            self._check_row(row)
             self._conn.execute(
                 "INSERT OR REPLACE INTO reset_tokens (username, tag, expires_at, issued_at)"
                 " VALUES (?, ?, ?, ?)",
-                (username, self._tag(token), now + float(ttl_seconds), now))
+                (username, self._reset_tag(username, token, expires_at), expires_at, now))
             self._conn.commit()
         return token
+
+    def _reset_tag(self, username: str, token: str, expires_at: float) -> bytes:
+        """Keyed tag over (store, user, token, expiry): a DB write can neither
+        mint a token nor extend one (F20)."""
+        return self._tag("|".join([self._store_id, username, token, repr(float(expires_at))]))
 
     def reset_token_redeem(self, token: str, new_password: str) -> Optional[str]:
         """Set a new password if `token` is live. Returns the username, else None.
@@ -1197,7 +1262,6 @@ class UserStore:
             return None
         _require_password(new_password)
         self._require_fields_key()
-        tag = self._tag(token)
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
@@ -1205,8 +1269,12 @@ class UserStore:
                     "SELECT username, tag, expires_at FROM reset_tokens").fetchall()
                 hit = None
                 for username, stored, expires_at in row:
+                    if not isinstance(expires_at, (int, float)) or \
+                            not isinstance(username, str):
+                        continue
+                    expected = self._reset_tag(username, token, expires_at)
                     if isinstance(stored, (bytes, bytearray)) and \
-                            hmac.compare_digest(bytes(stored), tag):
+                            hmac.compare_digest(bytes(stored), expected):
                         hit = (username, expires_at)
                 if hit is None:
                     return None
@@ -1214,8 +1282,10 @@ class UserStore:
                 self._conn.execute("DELETE FROM reset_tokens WHERE username = ?", (username,))
                 if not isinstance(expires_at, (int, float)) or time.time() > expires_at:
                     return None
-                if self._row(username) is None:
+                target = self._row(username)
+                if target is None:
                     return None
+                self._check_row(target)
                 self._write_password(username, new_password,
                                      (ARGON2_TIME_COST, ARGON2_MEMORY_COST,
                                       ARGON2_PARALLELISM), changed=True, commit=False)

@@ -162,16 +162,26 @@ the `.v1-backup` file — it still contains the old plaintext metadata.
   database without the key cannot brute-force a 50-bit recovery code
   offline, nor mint a reset. A store created without `fields_key` cannot
   hold any of this; the policy is one-way, and `sofiavault doctor` warns.
-- **Typed flags are authenticated too.** `role`, `is_admin` and
-  `is_active` are plaintext columns so policy queries can filter on them,
-  but on a store that has `fields_key` each row also carries
-  `HMAC-SHA256(fields_key, username | role | is_admin | is_active)`, checked
-  whenever `verify()` or `get_user()` returns them. Setting `is_admin = 1`
-  with a SQL client — or reviving a deactivated account — surfaces as
-  `FieldsTampered`, exactly like a forged encrypted profile did in 0.3.0.
-  A store created *without* `fields_key` has no such tags: its flags are
-  as unauthenticated as the rest of its row, which is one more reason to
-  create stores with a key.
+- **Every credential row is authenticated, per store.** On a store that
+  has `fields_key`, each row carries `HMAC-SHA256(fields_key, store_id |
+  username | salt | verify_hash | costs | fields | is_active | role |
+  is_admin | totp_enc | totp_counter | totp_confirmed | recovery_enc |
+  legacy_hash | password_changed_at)`, checked *before* the password is
+  looked at in `verify()` and in every MFA, recovery, reset and flag
+  operation. Setting `is_admin = 1` with a SQL client, switching MFA off
+  by nulling the seed or un-confirming it, rolling the replay counter
+  back, swapping another user's password material onto the admin, or
+  poisoning `legacy_hash` all surface as `FieldsTampered`. The random
+  `store_id` (in `auth_meta`) is part of the tag and of the TOTP/recovery
+  AAD, so a row copied from another store that shares the key is
+  rejected; reset-token tags cover their expiry, so a DB write cannot
+  extend one. **Limit:** a per-row tag authenticates *state*, not
+  *history* — restoring a whole row together with its earlier tag is a
+  valid earlier state (a used recovery code or TOTP step comes back). The
+  file's own protections (0600, the host) are the control there. A store
+  created *without* `fields_key` carries no tags: its rows are as
+  unauthenticated as its file, which is one more reason to create stores
+  with a key.
 - **TOTP replay is closed atomically.** The last accepted time-step is
   read, the code checked, and the step written inside one
   `BEGIN IMMEDIATE` transaction, so two submissions of the same code —
