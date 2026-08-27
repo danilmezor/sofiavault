@@ -74,6 +74,30 @@ sessions and policy.
   the *most expensive* row, and cheaper rows are padded up to it), and a
   0.4.0 threat-model table added.
 
+### Security (pre-release review of 0.4.0, findings F1–F13)
+- **A v3 vault with its MAC stripped is tamper evidence again.** The
+  adoption path compared against the *current* schema version, so moving
+  it to 4 quietly re-adopted every stripped v3 vault (F1).
+- **Credential rows are authenticated as a whole, per store** (`row_tag`
+  + `store_id`, see above): a SQL write cannot grant admin, disable MFA,
+  replay a code, swap password material or transplant rows between stores
+  sharing a key; reset-token tags cover their expiry (F2, F3, F20).
+- `rekey --key-file` claims the destination before rotating and prints the
+  new key once if the write still fails; unrelated existing files need
+  `--force` (F11). `import <vault>` backups never follow a symlink (F9).
+- Allowlists and `.env` files split on newline only — `str.splitlines()`
+  also breaks on VT/FF/FS/GS/RS/NEL/LS/PS, which `wc -l` and a reviewer do
+  not (F4). `SOFIAVAULT_FIELDS_KEY[_FILE]` and `SOFIAVAULT_PEPPER` are
+  stripped before `run` execs (F5). An import allowlist never admits a
+  denylisted name (F10).
+- `rekey` takes the write lock before reading rows (F7); `set()`/`delete()`
+  hold it across the existence check, so two processes cannot both insert
+  the same service (F8).
+- The unknown-user decoy's Argon2 work is capped at 16× the defaults, so
+  one extreme row cannot price every login (F6). `doctor` checks real file
+  and directory modes, the default `users.db`, and reports checks it could
+  not run (F12). Every read-only SQLite open goes through `_db_uri` (F13).
+
 ### Deprecated
 - `sofiavault auth import` — alias of `auth import-json` for one release.
 
