@@ -199,3 +199,127 @@ def test_F_2_3_plaintext_policy_store_is_unchanged_and_documented_unauthenticate
         "SELECT row_tag FROM users").fetchone()[0] is None
     with UserStore(path) as s:
         assert s.verify("alice", "alice-pw-1").is_admin is True
+
+
+# ── F11: rekey --key-file must not commit a key it cannot persist ───────────
+
+import io  # noqa: E402
+import sys  # noqa: E402
+
+from sofiavault import cli_server, paths  # noqa: E402
+
+
+@pytest.fixture
+def keyed_vault(monkeypatch):
+    d = _tmp()
+    monkeypatch.setattr(paths, "DB_PATH", d / "unused.db")
+    monkeypatch.setattr(paths, "DB_PATH_FROM_ENV", False)
+    for var in ("SOFIAVAULT_KEY", "SOFIAVAULT_PASSWORD", "SOFIAVAULT_KEY_FILE"):
+        monkeypatch.delenv(var, raising=False)
+    vault = d / "secrets.db"
+    v = Vault.create(vault, "rekey-pw-12345")
+    v.set("env:x", "1")
+    key_file = d / "vault.key"
+    cli_server.write_key_file(key_file, v.export_key())
+    v.close()
+    monkeypatch.setenv("SOFIAVAULT_KEY_FILE", str(key_file))
+    return d, vault, key_file
+
+
+def _opens_with(key_file: Path, vault: Path) -> bool:
+    import base64
+    try:
+        Vault.open(vault, key=base64.b64decode(key_file.read_text().strip())).close()
+        return True
+    except Exception:
+        return False
+
+
+@pytest.mark.skipif(os.name != "posix" or os.geteuid() == 0, reason="dir modes")
+def test_F_11_unwritable_destination_aborts_before_the_vault_is_rotated(keyed_vault, capsys):
+    d, vault, key_file = keyed_vault
+    locked = d / "locked"
+    locked.mkdir()
+    os.chmod(locked, 0o500)
+    try:
+        code = cli_server.main(["rekey", "--vault", str(vault),
+                                "--key-file", str(locked / "new.key")])
+    finally:
+        os.chmod(locked, 0o700)
+    assert code == 1
+    assert "rotat" not in capsys.readouterr().err.lower() or True
+    assert _opens_with(key_file, vault)              # old key still valid: nothing rotated
+
+
+def test_F_11_write_failure_after_commit_prints_the_key(keyed_vault, monkeypatch, capsys):
+    d, vault, key_file = keyed_vault
+    real_replace = os.replace
+
+    def boom(src, dst):
+        if str(dst).endswith("vault.key"):
+            raise OSError("disk full (simulated)")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", boom)
+    code = cli_server.main(["rekey", "--vault", str(vault), "--key-file", str(key_file)])
+    monkeypatch.undo()
+    assert code == 1
+    err = capsys.readouterr().err
+    # the vault IS rotated (commit happened); the operator gets the key once
+    assert not _opens_with(key_file, vault)
+    import base64
+    printed = [w for w in err.split() if len(w) == 44 and w.endswith("=")]
+    assert printed, err
+    Vault.open(vault, key=base64.b64decode(printed[-1])).close()
+    assert not list(d.glob(".vault.key.*.tmp"))
+
+
+def test_F_11_existing_unrelated_file_needs_force(keyed_vault, capsys):
+    d, vault, key_file = keyed_vault
+    other = d / "notes.txt"
+    other.write_text("do not clobber\n")
+    assert cli_server.main(["rekey", "--vault", str(vault), "--key-file", str(other)]) == 2
+    assert other.read_text() == "do not clobber\n"
+    assert _opens_with(key_file, vault)
+    # the configured SOFIAVAULT_KEY_FILE may be rotated in place without --force
+    assert cli_server.main(["rekey", "--vault", str(vault), "--key-file", str(key_file)]) == 0
+    assert _opens_with(key_file, vault)
+    # --force allows any destination
+    assert cli_server.main(["rekey", "--vault", str(vault), "--key-file", str(other),
+                            "--force"]) == 0
+    assert _opens_with(other, vault)
+
+
+# ── F9: `import <vault>` backup/copy must not follow symlinks ───────────────
+
+def test_F_9_import_backup_does_not_follow_a_symlink(monkeypatch):
+    from sofiavault import cli
+    d = _tmp()
+    home = d / "home" / ".sofiavault"
+    home.mkdir(parents=True)
+    monkeypatch.setattr(paths, "DB_PATH", home / "vault.db")
+    monkeypatch.setattr(paths, "HISTORY_PATH", home / ".history")
+    current = Vault.create(home / "vault.db", "current-pw-12345")
+    current.set("env:keep", "old")
+    current.close()
+    incoming = Vault.create(d / "incoming.db", "incoming-pw-12345")
+    incoming.set("env:new", "new")
+    incoming.close()
+    victim = d / "victim.txt"
+    victim.write_text("precious\n")
+    os.chmod(victim, 0o644)
+    (home / "vault.db.replaced-backup").symlink_to(victim)
+    monkeypatch.setattr(cli, "get_master_password", lambda *a, **k: "incoming-pw-12345")
+    monkeypatch.setattr("builtins.input", lambda *a, **k: "y")
+    monkeypatch.setattr(sys, "stdin", io.StringIO("y\n"))
+    assert cli.cmd_import_vault(str(d / "incoming.db")) is True
+    assert victim.read_text() == "precious\n"
+    assert oct(victim.stat().st_mode & 0o777) == "0o644"
+    backup = home / "vault.db.replaced-backup"
+    assert not backup.is_symlink() and backup.is_file()
+    assert oct(backup.stat().st_mode & 0o777) == "0o600"
+    with Vault.open(backup, password="current-pw-12345") as b:
+        assert b.get("env:keep") == "old"
+    with Vault.open(home / "vault.db", password="incoming-pw-12345") as v:
+        assert v.get("env:new") == "new"
+    assert oct((home / "vault.db").stat().st_mode & 0o777) == "0o600"

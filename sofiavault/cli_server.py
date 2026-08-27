@@ -312,19 +312,32 @@ def _read_new_password() -> str:
     return pw
 
 
-def write_key_file(path: Path, key_b64: str):
+def claim_key_file_tmp(path: Path) -> Path:
+    """Create the 0600 temp file the new key will be written to.
+
+    Done *before* the vault is rotated, so an unwritable destination fails
+    while the old key is still the only key (review finding F11).
+    """
+    tmp = path.with_name(f".{path.name}.{secrets.token_hex(4)}.tmp")
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    os.close(fd)
+    return tmp
+
+
+def write_key_file(path: Path, key_b64: str, tmp: Optional[Path] = None):
     """Write `key_b64` to `path` at 0600 via temp-file + atomic rename.
 
     At every instant either the old file or the new one is complete on
     disk — never neither, never a half-written key.
     """
-    tmp = path.with_name(f".{path.name}.{secrets.token_hex(4)}.tmp")
-    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    if tmp is None:
+        tmp = claim_key_file_tmp(path)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
+        with open(tmp, "w", encoding="utf-8") as f:
             f.write(key_b64 + "\n")
             f.flush()
             os.fsync(f.fileno())
+        os.chmod(tmp, 0o600)
         os.replace(tmp, path)
     except BaseException:
         with contextlib.suppress(OSError):
@@ -333,21 +346,58 @@ def write_key_file(path: Path, key_b64: str):
     os.chmod(path, 0o600)
 
 
+def _is_configured_key_file(path: Path) -> bool:
+    configured = os.environ.get("SOFIAVAULT_KEY_FILE")
+    if not configured:
+        return False
+    try:
+        return Path(configured).expanduser().resolve() == path.resolve()
+    except OSError:
+        return False
+
+
 def cmd_rekey(args) -> int:
     path = _vault_path(args.vault)
+    tmp: Optional[Path] = None
+    key_path: Optional[Path] = None
+    if args.key_file:
+        key_path = Path(args.key_file).expanduser()
+        if key_path.exists() and not _is_configured_key_file(key_path) and not args.force:
+            raise _Exit(EXIT_USAGE, f"{key_path} exists and is not the configured "
+                                    "SOFIAVAULT_KEY_FILE; pass --force to overwrite it")
+        try:
+            tmp = claim_key_file_tmp(key_path)
+        except OSError as exc:
+            raise _Exit(EXIT_ERROR, f"cannot write key file {key_path}: {exc}; "
+                                    "nothing was rotated") from exc
     v = _open(path)
     try:
-        if args.key_file:
-            key_path = Path(args.key_file).expanduser()
+        if key_path is not None:
             new_key = secrets.token_bytes(KEY_SIZE)
             new_b64 = v.rekey(new_key=new_key)
-            write_key_file(key_path, new_b64)
+            try:
+                write_key_file(key_path, new_b64, tmp=tmp)
+            except OSError as exc:
+                # The rotation is committed; this key now exists nowhere else.
+                print(f"error: the vault was rotated but the key file could not be "
+                      f"written ({exc}). The new key is shown ONCE below — save it to "
+                      f"a 0600 file now:", file=sys.stderr)
+                print(new_b64, file=sys.stderr)
+                raise _Exit(EXIT_ERROR, f"cannot write key file {key_path}") from exc
             print(f"rotated; new key written to {key_path}", file=sys.stderr)
         else:
             new_b64 = v.rekey(new_password=_read_new_password())
             print("rotated", file=sys.stderr)
     except VaultCorrupted as exc:
+        if tmp is not None:
+            with contextlib.suppress(OSError):
+                tmp.unlink()
         raise _Exit(EXIT_ERROR, f"rekey refused: {exc}") from exc
+    except _Exit:
+        if tmp is not None:
+            with contextlib.suppress(OSError):
+                tmp.unlink()
+        raise
     finally:
         v.close()
     if args.print_key:
@@ -748,6 +798,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--key-file", metavar="PATH",
                    help="rotate to a fresh random key and write it here (0600)")
     p.add_argument("--print-key", action="store_true", help="print the new base64 key")
+    p.add_argument("--force", action="store_true",
+                   help="overwrite an existing --key-file that is not $SOFIAVAULT_KEY_FILE")
     p.set_defaults(func=cmd_rekey)
 
     p = sub.add_parser("doctor", help="check a deployment would boot")

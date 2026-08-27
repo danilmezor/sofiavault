@@ -629,6 +629,26 @@ def cmd_export():
     print()
 
 
+def _copy_private(src: Path, dst: Path):
+    """Copy `src` to `dst` as a fresh 0600 regular file, never through a link.
+
+    shutil.copy2 follows a symlink at `dst`, so a link planted at the backup
+    path by another local user would have the vault written over — and
+    chmod-ed — wherever it pointed (review finding F9). The destination is
+    unlinked without following and re-created O_EXCL|O_NOFOLLOW at 0600.
+    """
+    if dst.is_symlink() or dst.exists():
+        dst.unlink()
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0)
+    fd = os.open(str(dst), flags, 0o600)
+    with os.fdopen(fd, 'wb') as out, open(src, 'rb') as inp:
+        shutil.copyfileobj(inp, out)
+        out.flush()
+        os.fsync(out.fileno())
+    with contextlib.suppress(OSError):
+        os.chmod(dst, 0o600)
+
+
 def cmd_import_vault(src: str) -> bool:
     """Replace the local vault with a vault file from another device.
 
@@ -684,15 +704,11 @@ def cmd_import_vault(src: str) -> bool:
             print()
             return False
         backup = paths.DB_PATH.with_name(paths.DB_PATH.name + ".replaced-backup")
-        shutil.copy2(paths.DB_PATH, backup)
-        with contextlib.suppress(OSError):
-            os.chmod(backup, 0o600)
+        _copy_private(paths.DB_PATH, backup)
         print_info(f"Previous vault backed up to {backup}")
 
-    paths.DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(path, paths.DB_PATH)
-    with contextlib.suppress(OSError):
-        os.chmod(paths.DB_PATH, 0o600)
+    paths.DB_PATH.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    _copy_private(path, paths.DB_PATH)
 
     print()
     print_success("Vault imported.")
