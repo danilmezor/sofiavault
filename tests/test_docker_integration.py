@@ -27,13 +27,15 @@ def _docker_available() -> bool:
     if shutil.which("docker") is None:
         return False
     try:
-        return subprocess.run(["docker", "info"], capture_output=True,
-                              timeout=20).returncode == 0
+        info = subprocess.run(["docker", "info", "--format", "{{.OSType}}"],
+                              capture_output=True, text=True, timeout=20)
     except (OSError, subprocess.TimeoutExpired):
         return False
+    return info.returncode == 0 and info.stdout.strip() == "linux"
 
 
-pytestmark = pytest.mark.skipif(not _docker_available(), reason="Docker is not available")
+pytestmark = pytest.mark.skipif(not _docker_available(),
+                                reason="A Docker daemon running Linux containers is not available")
 
 DOCKERFILE = f"""
 FROM python:{sys.version_info.major}.{sys.version_info.minor}-slim
@@ -93,5 +95,10 @@ def test_T_6_4_container_child_sees_secrets_but_inspect_does_not():
         assert "must-not-appear" not in inspect.stdout
     finally:
         subprocess.run(["docker", "rm", "-f", name], capture_output=True, timeout=60)
+        # Hand the files back to the host user before removing them: on Linux the
+        # chown above is real, so the host user can no longer touch them directly.
+        subprocess.run(["docker", "run", "--rm", "-v", f"{mount}:/m", "--user", "0", tag,
+                        "chown", "-R", f"{os.getuid()}:{os.getgid()}", "/m"],
+                       capture_output=True, timeout=120)
         subprocess.run(["docker", "rmi", "-f", tag], capture_output=True, timeout=60)
-        os.chmod(vault, 0o600)
+        shutil.rmtree(d, ignore_errors=True)
