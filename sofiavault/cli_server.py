@@ -68,7 +68,10 @@ def _stdin_is_tty() -> bool:
     # Windows reports the NUL device as a TTY; only a real console has a console mode.
     import ctypes
     import msvcrt
-    handle = msvcrt.get_osfhandle(sys.stdin.fileno())
+    try:
+        handle = msvcrt.get_osfhandle(sys.stdin.fileno())
+    except (OSError, ValueError):  # a stream without a file handle: trust isatty()
+        return True
     return bool(ctypes.windll.kernel32.GetConsoleMode(handle, ctypes.byref(ctypes.c_ulong())))
 
 

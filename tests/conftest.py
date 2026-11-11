@@ -3,9 +3,10 @@
 tests/test_docs.py checks that each T-id is implemented exactly once; that
 check is satisfied by a test that is skipped (no bcrypt, no Docker, no
 v0.3.0 tag). Here the outcome of every id-carrying test is recorded and,
-after a full run, ids that never passed are listed. With `CI` or
-`SOFIAVAULT_STRICT_IDS` set in the environment that list fails the session
-(review finding S2); otherwise it is reported as a warning line.
+after a full run, ids that never passed are listed. With
+`SOFIAVAULT_STRICT_IDS` set that list fails the session; CI sets it on Linux,
+the one platform where every id can run (Docker, POSIX file modes).
+Otherwise it is reported as a warning line.
 """
 
 import os
@@ -49,7 +50,7 @@ def pytest_sessionfinish(session, exitstatus):
         return
     detail = ", ".join(f"{i}({'/'.join(sorted(_outcomes.get(i, {'missing'})))})"
                        for i in not_passed)
-    strict = bool(os.environ.get("CI") or os.environ.get("SOFIAVAULT_STRICT_IDS"))
+    strict = bool(os.environ.get("SOFIAVAULT_STRICT_IDS"))
     reporter = session.config.pluginmanager.get_plugin("terminalreporter")
     line = (f"design test ids that did not pass: {detail}"
             + ("" if strict else "  [set SOFIAVAULT_STRICT_IDS=1 to fail on this]"))

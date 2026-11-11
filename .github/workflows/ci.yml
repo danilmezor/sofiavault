@@ -41,3 +41,6 @@ jobs:
 
       - name: Run tests
         run: pytest -v
+        env:
+          # Every design test id must pass on Linux, where Docker and POSIX modes exist.
+          SOFIAVAULT_STRICT_IDS: ${{ startsWith(matrix.os, 'ubuntu') && '1' || '' }}

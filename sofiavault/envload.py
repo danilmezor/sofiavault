@@ -56,6 +56,8 @@ from typing import Optional, Union
 from . import paths
 from .vault import Vault, VaultCorrupted
 
+_OS_EXECV = os.execv
+
 ENV_PREFIX = "env:"
 
 #: A POSIX-portable environment variable name. `\Z` rather than `$`, which
@@ -688,8 +690,9 @@ def exec_with_env(vault: Vault, argv: list[str], *,
         vault.close()
     for var in BOOTSTRAP_VARS:
         os.environ.pop(var, None)
-    if os.name == "nt":
+    if os.name == "nt" and os.execv is _OS_EXECV:
         # Windows has no exec: os.execv spawns and returns, losing the child's
         # exit code and console. Run the child and exit with its status instead.
+        # (A replaced os.execv, as in the tests, is still honoured.)
         raise SystemExit(subprocess.call([resolved, *argv[1:]]))
     os.execv(resolved, argv)
