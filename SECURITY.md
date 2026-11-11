@@ -6,7 +6,8 @@ If you discover a security vulnerability in SofiaVault, please report it respons
 
 **Do NOT open a public GitHub issue for security vulnerabilities.**
 
-Instead, please email: **danil.zanozin@gmail.com**
+Instead, report it privately through GitHub: open the repository's **Security** tab and choose
+**Report a vulnerability** (https://github.com/danilmezor/sofiavault/security/advisories/new).
 
 You should receive a response within 48 hours. Please include:
 

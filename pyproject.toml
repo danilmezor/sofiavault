@@ -5,9 +5,9 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "sofiavault"
 version = "0.4.0"
-description = "A secure terminal password manager with fuzzy matching"
+description = "Encrypted secrets for your terminal, your servers and your app: a password manager, a .env replacement and a user credential store"
 readme = "README.md"
-license = "MIT"
+license = "Apache-2.0"
 requires-python = ">=3.9"
 keywords = ["password-manager", "security", "encryption", "cli", "terminal"]
 classifiers = [

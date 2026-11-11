@@ -2,6 +2,13 @@
 
 All notable changes to SofiaVault will be documented in this file.
 
+## [Unreleased]
+
+### Changed
+
+- License changed from MIT to Apache-2.0. Releases up to 0.4.0 stay available under MIT.
+- Security reports go through GitHub private vulnerability reporting.
+
 ## [0.4.0] - 2026-08-26
 
 The first real server integration of 0.3.0 found every gap forced a
