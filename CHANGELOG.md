@@ -9,6 +9,12 @@ All notable changes to SofiaVault will be documented in this file.
 - License changed from MIT to Apache-2.0. Releases up to 0.4.0 stay available under MIT.
 - Security reports go through GitHub private vulnerability reporting.
 
+### Fixed
+
+- Windows: server commands with stdin redirected no longer wait for a password
+  (Windows reports the NUL device as a terminal).
+- Windows: `sofiavault run` keeps the child's output and exits with its status.
+
 ## [0.4.0] - 2026-08-26
 
 The first real server integration of 0.3.0 found every gap forced a
