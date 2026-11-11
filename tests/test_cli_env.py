@@ -252,7 +252,8 @@ def test_T_5_4_rekey_key_file_never_leaves_no_valid_key(sandbox, monkeypatch, ca
                 "--print-key"]) == 0
     printed = capsys.readouterr().out.strip()
     assert key_file.read_text().strip() == printed
-    assert oct(key_file.stat().st_mode & 0o777) == "0o600"
+    if os.name != "nt":  # Windows has no POSIX file modes
+        assert oct(key_file.stat().st_mode & 0o777) == "0o600"
     assert _key_opens(key_file, vault)
     with pytest.raises(WrongPassword):
         Vault.open(vault, password=PW)

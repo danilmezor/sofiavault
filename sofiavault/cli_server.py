@@ -61,7 +61,15 @@ def _warn(msg: str):
 
 
 def _stdin_is_tty() -> bool:
-    return sys.stdin is not None and sys.stdin.isatty()
+    if sys.stdin is None or not sys.stdin.isatty():
+        return False
+    if os.name != "nt":
+        return True
+    # Windows reports the NUL device as a TTY; only a real console has a console mode.
+    import ctypes
+    import msvcrt
+    handle = msvcrt.get_osfhandle(sys.stdin.fileno())
+    return bool(ctypes.windll.kernel32.GetConsoleMode(handle, ctypes.byref(ctypes.c_ulong())))
 
 
 # ── vault resolution / unlock ───────────────────────────────────────────────

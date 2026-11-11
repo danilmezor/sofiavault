@@ -22,13 +22,13 @@ TEST_NAME_RE = re.compile(r"^\s*def (test_\w*?T_(\d+)_(\d+)\w*)\(", re.M)
 
 
 def _expected_ids() -> set:
-    return {m.group(0) for m in ID_RE.finditer(ID_FILE.read_text())}
+    return {m.group(0) for m in ID_RE.finditer(ID_FILE.read_text(encoding="utf-8"))}
 
 
 def _implemented_ids() -> dict:
     found: dict = {}
     for path in TESTS.glob("test_*.py"):
-        for m in TEST_NAME_RE.finditer(path.read_text()):
+        for m in TEST_NAME_RE.finditer(path.read_text(encoding="utf-8")):
             found.setdefault(f"T-{m.group(2)}-{m.group(3)}", []).append(
                 f"{path.name}::{m.group(1)}")
     return found
@@ -36,7 +36,7 @@ def _implemented_ids() -> dict:
 
 @pytest.mark.skipif(not DESIGN_DOC.exists(), reason="design doc is local-only")
 def test_id_list_matches_design_doc():
-    in_doc = {m.group(0) for m in ID_RE.finditer(DESIGN_DOC.read_text())}
+    in_doc = {m.group(0) for m in ID_RE.finditer(DESIGN_DOC.read_text(encoding="utf-8"))}
     assert in_doc == _expected_ids(), (
         "regenerate tests/fixtures/test-ids-0.4.0.txt from the design doc")
 
@@ -79,7 +79,7 @@ DOES_NOT_PROTECT = (
 
 def _threat_paragraphs() -> tuple:
     if DESIGN_DOC.exists():
-        text = DESIGN_DOC.read_text()
+        text = DESIGN_DOC.read_text(encoding="utf-8")
         sec = text[text.index("### D-13"):text.index("### D-14")]
 
         def para(prefix):
@@ -90,7 +90,7 @@ def _threat_paragraphs() -> tuple:
 
 
 def test_T_13_1_security_md_carries_the_threat_table_and_corrected_decoy_statement():
-    text = (ROOT / "SECURITY.md").read_text()
+    text = (ROOT / "SECURITY.md").read_text(encoding="utf-8")
     normalized = " ".join(text.split())
     protects, does_not = _threat_paragraphs()
     assert f"| **Protects** | {protects} |" in normalized
@@ -116,7 +116,10 @@ ALLOWED_CHANGES = {
     "test_security_regressions.py": {
         "test_h3_new_vaults_are_schema_v3",
         "test_h3_v2_vault_upgrades_transparently",
-        "test_h6_rollback_plus_mac_delete_plus_version_rollback_is_detected"},
+        "test_h6_rollback_plus_mac_delete_plus_version_rollback_is_detected",
+        # Skipped on Windows, which has no POSIX file modes.
+        "test_l1_files_never_world_readable_even_under_loose_umask",
+        "test_l12_group_readable_key_file_refused"},
 }
 
 _FUNC_RE = re.compile(r"^(?=def test_)", re.M)
@@ -133,7 +136,7 @@ def _test_bodies(text: str) -> dict:
 def _git_show(ref: str, path: str):
     try:
         out = subprocess.run(["git", "show", f"{ref}:{path}"], cwd=ROOT,
-                             capture_output=True, text=True, timeout=30)
+                             capture_output=True, text=True, encoding="utf-8", timeout=30)
     except (OSError, subprocess.TimeoutExpired):
         return None
     return out.stdout if out.returncode == 0 else None
@@ -168,7 +171,7 @@ def test_T_14_1_the_0_3_0_test_suite_is_unmodified_except_for_enumerated_tests()
         old = _git_show("v0.3.0", f"tests/{name}")
         new_path = TESTS / name
         assert new_path.exists(), f"0.3.0 test file removed: {name}"
-        new_text = new_path.read_text()
+        new_text = new_path.read_text(encoding="utf-8")
         removed = set(_preamble(old)) - set(_preamble(new_text))
         added = set(_preamble(new_text)) - set(_preamble(old))
         allowed_removed, allowed_added = ALLOWED_PREAMBLE_CHANGES.get(name, (set(), set()))

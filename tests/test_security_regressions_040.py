@@ -293,6 +293,8 @@ def test_F_11_existing_unrelated_file_needs_force(keyed_vault, capsys):
 # ── F9: `import <vault>` backup/copy must not follow symlinks ───────────────
 
 def test_F_9_import_backup_does_not_follow_a_symlink(monkeypatch):
+    if os.name == "nt":
+        pytest.skip("POSIX file modes and symlinks")
     from sofiavault import cli
     d = _tmp()
     home = d / "home" / ".sofiavault"
@@ -554,6 +556,8 @@ def test_F_12_doctor_flags_world_writable_files_and_dirs(monkeypatch, capsys):
 # ── F13: every read-only open goes through _db_uri ──────────────────────────
 
 def test_F_13_read_only_opens_survive_question_marks_in_the_path(monkeypatch):
+    if os.name == "nt":
+        pytest.skip("'?' is not allowed in Windows file names")
     from sofiavault import cli
     d = _tmp() / "odd?dir#1"
     d.mkdir()
@@ -586,7 +590,7 @@ def test_F_13_read_only_opens_survive_question_marks_in_the_path(monkeypatch):
     assert set(os.listdir(d)) == set(before) | {"legacy?.db", "u?.db"}
     assert "file:" not in str(list(d.iterdir()))
     import re
-    src_text = "".join(Path(f).read_text() for f in [
+    src_text = "".join(Path(f).read_text(encoding="utf-8") for f in [
         "sofiavault/storage.py", "sofiavault/auth.py", "sofiavault/cli.py",
         "sofiavault/cli_server.py"])
     assert not re.search(r'f"file:\{', src_text), "hand-built sqlite URIs remain"
@@ -716,7 +720,8 @@ def test_F_19_env_set_on_a_tty_uses_getpass(monkeypatch, capsys):
 
 def test_F_21_no_pre_argparse_server_code_remains_in_cli():
     from sofiavault import cli
-    src = (Path(__file__).resolve().parent.parent / "sofiavault" / "cli.py").read_text()
+    cli_path = Path(__file__).resolve().parent.parent / "sofiavault" / "cli.py"
+    src = cli_path.read_text(encoding="utf-8")
     assert "exec_with_env(" not in src
     assert "import_env_file(" not in src
     assert "import_json(" not in src

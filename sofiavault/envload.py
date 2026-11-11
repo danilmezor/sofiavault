@@ -47,6 +47,7 @@ by the CLI (`sofiavault run --allow FILE`) and the library
 import os
 import re
 import shutil
+import subprocess
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -687,4 +688,8 @@ def exec_with_env(vault: Vault, argv: list[str], *,
         vault.close()
     for var in BOOTSTRAP_VARS:
         os.environ.pop(var, None)
+    if os.name == "nt":
+        # Windows has no exec: os.execv spawns and returns, losing the child's
+        # exit code and console. Run the child and exit with its status instead.
+        raise SystemExit(subprocess.call([resolved, *argv[1:]]))
     os.execv(resolved, argv)

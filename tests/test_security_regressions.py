@@ -513,6 +513,8 @@ def test_l9_import_json_reports_reasons_and_refuses_coercion():
 # ── L1 / L7 / L12: hardening ─────────────────────────────────────────────────
 
 def test_l1_files_never_world_readable_even_under_loose_umask():
+    if os.name == "nt":
+        pytest.skip("POSIX file modes")
     import stat
     old = os.umask(0o000)
     try:
@@ -536,6 +538,8 @@ def test_l7_destructive_helpers_not_in_public_api():
 
 
 def test_l12_group_readable_key_file_refused():
+    if os.name == "nt":
+        pytest.skip("POSIX file modes")
     from sofiavault.vault import VaultLocked
     v, path = _vault()
     key_b64 = v.export_key()
